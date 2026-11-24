@@ -575,11 +575,14 @@ function initHeader() {
     'pointerdown',
     (e) => {
       if (!(e.target instanceof Element)) return;
-      if (!e.target.closest('.top-pop')) {
-        closePops();
-        e.preventDefault();
-        e.stopPropagation();
-      }
+      if (e.target.closest('.top-pop')) return;
+      const notif = $('#notif-pop');
+      const who = $('#who-pop');
+      const open = (notif && !notif.hidden) || (who && !who.hidden);
+      if (!open) return;
+      closePops();
+      e.preventDefault();
+      e.stopPropagation();
     },
     true
   );

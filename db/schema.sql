@@ -85,6 +85,19 @@ CREATE TABLE IF NOT EXISTS surveyor_profile (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+/* The signature and stamp printed in every report footer (§13). They belong to the account, not
+   to a device: an image uploaded on a laptop must appear when the same account signs in from a
+   phone or another PC, which the browser-only store could not do. An empty image is kept as a
+   row on purpose — it records that the surveyor removed the image, so another device holding an
+   older offline copy does not upload it back. */
+CREATE TABLE IF NOT EXISTS user_assets (
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind VARCHAR(8) NOT NULL CHECK (kind IN ('sig', 'stp')),
+  image TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, kind)
+);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -233,6 +246,8 @@ INSERT INTO permissions (key, label, group_name, description) VALUES
   ('verify_documents',              'Verify or reject a document',     'Workflow',     'Accept a document as checked, or send it back with a reason.'),
   ('validate_case',                 'Validate a case',                 'Workflow',     'Quality validation of a finished file.'),
   ('add_case_comments',             'Add case comments',               'Workflow',     'Notes visible to the rest of the team.'),
+  ('manage_customer_invitations',   'Request customer information',    'Workflow',     'Create, re-send and revoke the links that ask a customer for information.'),
+  ('approve_customer_submissions',  'Approve customer submissions',    'Workflow',     'Check what a customer sent and apply it to the case.'),
   ('export_case_report',            'Export a case report',            'Workflow',     'Produce the finished document.'),
   ('delete_case',                   'Delete a case',                   'Administration','Irreversible removal of a case and its attachments.'),
   ('manage_users',                  'Create and change accounts',      'Administration','Open staff accounts, change roles, reset passwords.'),
@@ -264,7 +279,7 @@ SELECT 'SURVEYOR', key FROM permissions WHERE key IN (
   'enter_repair_bill_information', 'complete_inspection_checklist', 'upload_inspection_photos',
   'upload_documents', 'delete_own_unverified_uploads', 'create_case', 'assign_case',
   'reassign_case', 'submit_tasks', 'approve_task', 'verify_documents', 'validate_case',
-  'add_case_comments',
+  'add_case_comments', 'manage_customer_invitations', 'approve_customer_submissions',
   'export_case_report', 'use_ai_assistance'
 )
 ON CONFLICT DO NOTHING;
@@ -682,7 +697,7 @@ BEGIN
     ('case_assigned', 'task_assigned', 'deadline_approaching', 'deadline_missed',
      'document_rejected', 'task_approved', 'correction_requested', 'admin_instruction',
      'work_submitted', 'assignment_changed', 'account_suspended', 'password_reset_requested',
-     'case_comment'));
+     'case_comment', 'customer_submission'));
 END
 $$;
 
@@ -825,3 +840,158 @@ CREATE INDEX IF NOT EXISTS idx_third_party_claim_assets_claim ON third_party_cla
 CREATE INDEX IF NOT EXISTS idx_third_party_claim_inspections_claim ON third_party_claim_inspections(claim_id, inspection_date);
 CREATE INDEX IF NOT EXISTS idx_third_party_claim_assessments_claim ON third_party_claim_assessments(claim_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_third_party_activity_claim ON third_party_activity_history(claim_id, created_at DESC);
+
+/* ---------------------------------------------------------------------------
+   Customer information portal — invitations and submissions
+   ---------------------------------------------------------------------------
+   The customer holds an opaque link and no account. Everything the operator does
+   to that link is recorded here, and the link's token is only ever kept as a
+   keyed hash, the same way sessions and reset links are: a dump of this table
+   cannot be used to open anybody's invitation.
+
+   case_id is ON DELETE SET NULL rather than CASCADE, and each row keeps its own
+   copy of the case number. Past conversations with a customer are evidence, so
+   deleting a case must not delete the record that the customer was asked
+   something and what they answered. For the same reason expiry and revocation
+   only close the link — they never remove a submission or a file.
+
+   An invitation may produce several submission versions through controlled
+   resubmission. `version` is unique per invitation, and `original_payload` is
+   frozen by a trigger once written: operators correct in `corrected_payload`,
+   so the customer's own words survive review. `base_case_modified_at` records
+   the case's timestamp when the submission began, which is what a later
+   approval uses to notice that the surveyor changed the case in the meantime.
+   --------------------------------------------------------------------------- */
+CREATE TABLE IF NOT EXISTS case_portal_invitations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  case_id TEXT REFERENCES cases(id) ON DELETE SET NULL,
+  case_number VARCHAR(120),
+  created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  revoked_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  token_hash CHAR(64) NOT NULL UNIQUE,
+  token_generation INTEGER NOT NULL DEFAULT 1,
+  customer_name VARCHAR(200) NOT NULL,
+  customer_contact VARCHAR(200),
+  note TEXT,
+  /* NULL means every section the case module can ask for; an array is the surveyor's own choice of
+     section ids, so a link can ask for the vehicle only and never show the accident page. */
+  requested_sections JSONB,
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  revoke_reason TEXT,
+  regenerated_at TIMESTAMPTZ,
+  first_opened_at TIMESTAMPTZ,
+  last_opened_at TIMESTAMPTZ,
+  open_count INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS case_portal_submissions (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  invitation_id UUID NOT NULL REFERENCES case_portal_invitations(id) ON DELETE CASCADE,
+  case_id TEXT REFERENCES cases(id) ON DELETE SET NULL,
+  case_number VARCHAR(120),
+  version INTEGER NOT NULL DEFAULT 1,
+  status VARCHAR(24) NOT NULL DEFAULT 'Draft' CHECK (status IN
+    ('Draft', 'Submitted', 'Under Review', 'Approved', 'Rejected', 'Withdrawn')),
+  original_payload JSONB,
+  original_submitted_at TIMESTAMPTZ,
+  corrected_payload JSONB,
+  base_case_modified_at TIMESTAMPTZ,
+  customer_name VARCHAR(200),
+  customer_contact VARCHAR(200),
+  submitted_ip VARCHAR(64),
+  /* The browser's id for one submit attempt and the hash of what was actually sent. Together they
+     make a double-tapped Submit button one submission: the id says "this is the same attempt" and
+     the hash says "this is the same information", so neither a retry nor a refresh writes v2. */
+  client_submission_id UUID,
+  payload_sha256 CHAR(64),
+  reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  reviewed_at TIMESTAMPTZ,
+  approved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+  approved_at TIMESTAMPTZ,
+  decision_reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (invitation_id, version)
+);
+
+/* Columns added after the first invitations were issued. CREATE TABLE IF NOT EXISTS does not touch
+   an existing table, so these are applied on every boot the same way the users columns are. */
+ALTER TABLE case_portal_invitations ADD COLUMN IF NOT EXISTS requested_sections JSONB;
+ALTER TABLE case_portal_submissions ADD COLUMN IF NOT EXISTS client_submission_id UUID;
+ALTER TABLE case_portal_submissions ADD COLUMN IF NOT EXISTS payload_sha256 CHAR(64);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_portal_submissions_client
+  ON case_portal_submissions(invitation_id, client_submission_id)
+  WHERE client_submission_id IS NOT NULL;
+
+/* One draft per invitation, separate from the submission versions: a draft is what the customer is
+   still writing, it can change on every keystroke, and it is removed once they submit. */
+CREATE TABLE IF NOT EXISTS case_portal_drafts (
+  invitation_id UUID PRIMARY KEY REFERENCES case_portal_invitations(id) ON DELETE CASCADE,
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+/* Placeholder for the customer's files. Phase 1 writes no rows to either table; it exists now so the
+   storage story is settled before an upload route is written: a file is quarantined under its own
+   submission and only points at a real document row once an operator has accepted it. */
+CREATE TABLE IF NOT EXISTS case_portal_submission_files (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  submission_id UUID NOT NULL REFERENCES case_portal_submissions(id) ON DELETE CASCADE,
+  document_id UUID REFERENCES documents(id) ON DELETE SET NULL,
+  slot VARCHAR(120),
+  category VARCHAR(80),
+  original_filename VARCHAR(255) NOT NULL,
+  mime_type VARCHAR(160),
+  byte_size BIGINT,
+  sha256 CHAR(64),
+  storage_path TEXT,
+  status VARCHAR(24) NOT NULL DEFAULT 'Pending' CHECK (status IN
+    ('Pending', 'Accepted', 'Rejected', 'Superseded')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS case_portal_submission_events (
+  id BIGSERIAL PRIMARY KEY,
+  invitation_id UUID REFERENCES case_portal_invitations(id) ON DELETE CASCADE,
+  submission_id UUID REFERENCES case_portal_submissions(id) ON DELETE SET NULL,
+  actor_type VARCHAR(16) NOT NULL CHECK (actor_type IN ('customer', 'operator', 'system')),
+  actor_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+  action VARCHAR(80) NOT NULL,
+  from_status VARCHAR(24),
+  to_status VARCHAR(24),
+  reason TEXT,
+  details JSONB NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+/* The customer's own words are evidence. A correction belongs in corrected_payload, never in the
+   original, so the database refuses the overwrite even if a future route tries it. */
+CREATE OR REPLACE FUNCTION case_portal_submission_freeze_original() RETURNS trigger AS $fn$
+BEGIN
+  IF OLD.original_payload IS NOT NULL AND NEW.original_payload IS DISTINCT FROM OLD.original_payload THEN
+    RAISE EXCEPTION 'the original customer submission cannot be overwritten';
+  END IF;
+  IF OLD.original_submitted_at IS NOT NULL
+     AND NEW.original_submitted_at IS DISTINCT FROM OLD.original_submitted_at THEN
+    RAISE EXCEPTION 'the original submission time cannot be changed';
+  END IF;
+  RETURN NEW;
+END
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_case_portal_submission_freeze ON case_portal_submissions;
+CREATE TRIGGER trg_case_portal_submission_freeze
+  BEFORE UPDATE ON case_portal_submissions
+  FOR EACH ROW EXECUTE FUNCTION case_portal_submission_freeze_original();
+
+CREATE INDEX IF NOT EXISTS idx_portal_invitations_case ON case_portal_invitations(case_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_portal_invitations_expiry ON case_portal_invitations(expires_at);
+CREATE INDEX IF NOT EXISTS idx_portal_submissions_invitation ON case_portal_submissions(invitation_id, version DESC);
+CREATE INDEX IF NOT EXISTS idx_portal_submissions_case ON case_portal_submissions(case_id);
+CREATE INDEX IF NOT EXISTS idx_portal_files_submission ON case_portal_submission_files(submission_id);
+CREATE INDEX IF NOT EXISTS idx_portal_events_invitation ON case_portal_submission_events(invitation_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_portal_events_submission ON case_portal_submission_events(submission_id, created_at DESC);

@@ -139,16 +139,26 @@ function ivCard(q, L, i, redraw) {
         ins = {};
       tr.append(h('td', { class: 'sn' }, ri + 1));
       COL.forEach(([k, ph, ty], ci) => {
-        const e = h('input', { placeholder: ph });
+        const mny = k === 'rate' || k === 'amt' || k === 'as',
+          e = h('input', { placeholder: ph });
         if (ty === 'number') {
-          e.type = 'number';
-          e.step = 'any';
-          e.min = '0';
+          if (mny) {
+            e.type = 'text';
+            e.inputMode = 'decimal';
+            e.className = 'mn';
+          } else {
+            e.type = 'number';
+            e.step = 'any';
+            e.min = '0';
+          }
         }
-        e.value = r[k] || '';
+        e.value = mny ? inrShow(r[k], true) : r[k] || '';
         ins[k] = e;
         e.oninput = () => {
-          r[k] = e.value;
+          if (mny) {
+            fmtMoneyInput(e, false);
+            r[k] = inrRaw(e.value);
+          } else r[k] = e.value;
           if (
             (k === 'qty' || k === 'rate') &&
             r.qty !== '' &&
@@ -157,13 +167,19 @@ function ivCard(q, L, i, redraw) {
             isFinite(r.rate)
           ) {
             r.amt = String(Math.round(+r.qty * +r.rate * 100) / 100);
-            ins.amt.value = r.amt;
+            ins.amt.value = inrShow(r.amt, true);
           }
           foot();
           pb();
           sv();
         };
-        e.onblur = () => sv(1);
+        e.onfocus = () => {
+          if (mny) e.value = inrShow(e.value, false);
+        };
+        e.onblur = () => {
+          if (mny) e.value = inrShow(e.value, true);
+          sv(1);
+        };
         e.onkeydown = (ev) => {
           const go = (d) => {
             ev.preventDefault();
@@ -192,7 +208,9 @@ function ivCard(q, L, i, redraw) {
             const row = iv.rows[ri + li] || (iv.rows.push(newRow()), iv.rows[ri + li]);
             ln.split('\t').forEach((cv, cj) => {
               const c = COL[ci + cj];
-              if (c) row[c[0]] = cv.trim();
+              if (!c) return;
+              const mny = c[0] === 'rate' || c[0] === 'amt' || c[0] === 'as';
+              row[c[0]] = mny ? inrRaw(cv) : cv.trim();
             });
           });
           draw();
@@ -367,14 +385,14 @@ function billsHTML() {
   return Object.keys(BT)
     .filter(bq)
     .map((q) => {
-      const L = bn(q).filter((iv) => iv.no || iv.rows.some((r) => r.d || r.amt || r.as));
+      const L = bn(q).filter(ivFilled);
       if (!L.length) return '';
       return (
         `<h3>${BT[q]}</h3>` +
         L.map(
           (iv) =>
             `<h4>Invoice ${esc(iv.no || '(no. not entered)')}${iv.vendor ? ' \u2013 ' + esc(iv.vendor) : ''}${iv.date ? ' \u00b7 ' + esc(dtf(iv.date)) : ''}</h4><table><colgroup><col style='width:6%'><col style='width:30%'><col style='width:7%'><col style='width:13%'><col style='width:14%'><col style='width:14%'><col style='width:16%'></colgroup><tr><th>S.N.</th><th>Description</th><th>Qty</th><th>Rate</th><th>Billed</th><th>Assessed</th><th>Remarks</th></tr>${iv.rows
-              .filter((r) => r.d || r.amt || r.as)
+              .filter(rowFilled)
               .map(
                 (r, j) =>
                   `<tr><td>${j + 1}</td><td>${esc(r.d || '')}</td><td>${esc(r.qty || '')}</td><td>${r.rate ? esc(money(r.rate)) : ''}</td><td>${esc(money(r.amt))}</td><td>${esc(money(r.as))}</td><td>${esc(r.rm || '')}</td></tr>`
@@ -397,7 +415,7 @@ function billsText() {
         BT[q] +
         ':\n' +
         (bn(q)
-          .filter((iv) => iv.no || iv.rows.some((r) => r.d || r.amt || r.as))
+          .filter((iv) => iv.no || iv.vendor || iv.date || iv.rows.some(rowFilled))
           .map(
             (iv) =>
               'Invoice ' +
@@ -406,7 +424,7 @@ function billsText() {
               (iv.date ? ' dated ' + iv.date : '') +
               '\n' +
               iv.rows
-                .filter((r) => r.d || r.amt || r.as)
+                .filter(rowFilled)
                 .map(
                   (r) =>
                     `  - ${r.d || 'item'} | qty ${r.qty || '-'} | rate ${r.rate || '-'} | billed ${money(r.amt)} | assessed ${money(r.as)}${r.rm ? ' | ' + r.rm : ''}`

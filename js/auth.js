@@ -339,22 +339,9 @@
     root.className = 'auth-shell';
     root.innerHTML = [
       '<div class="auth-layout">',
-      '<aside class="auth-visual" aria-label="SurveyPro branding">',
-      '<div class="auth-visual-inner">',
-      '<img src="assets/survey-desk-logo.svg" alt="SurveyPro" class="auth-logo-art" />',
-      '<div class="auth-visual-copy">',
-      '<h2>SurveyPro</h2>',
-      '<p>Claim survey and loss assessment desk</p>',
-      '</div>',
-      '</div>',
-      '</aside>',
       '<div class="auth-card">',
-      '<div class="auth-brand">',
-      '<div class="auth-brand-mark" aria-hidden="true">SP</div>',
-      '<div class="auth-brand-copy">',
-      '<strong>SurveyPro</strong>',
-      '<span>Secure field reporting</span>',
-      '</div>',
+      '<div class="auth-logo-box">',
+      '<img src="assets/survey-desk-signature-horizontal.svg" alt="Survey Desk" class="auth-logo-art" />',
       '</div>',
       '<div class="auth-mode-switch" role="tablist" aria-label="Authentication mode">',
       '<button type="button" class="auth-mode-btn is-active" data-mode="login" role="tab">Sign in</button>',
@@ -1028,10 +1015,12 @@
       signedIn = Boolean(session.user);
     } catch (error) {
       session.user = null;
-      if (!notice) notice = { message: error.message, kind: 'error' };
+      /* An ordinary 401 is this browser not being signed in, which is exactly what the sign-in
+         screen is for; printing "Authentication required" above the form it is already asking
+         for would read as a failure the person caused. */
+      if (!notice && error.status !== 401) notice = { message: error.message, kind: 'error' };
       /* A 404 or a refused connection is not a failed sign-in — it is this page having no API
-         behind it, which is a different thing to tell the surveyor. The ordinary 401 of a
-         signed-out browser is left exactly as it was. */
+         behind it, which is a different thing to tell the surveyor. */
       if (error.status === 404 || !error.status) {
         const where = await apiWhere();
         if (where !== 'ours') notice = { message: '', kind: 'error', noServer: where };

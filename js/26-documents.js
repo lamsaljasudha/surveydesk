@@ -256,6 +256,17 @@ async function dvSendOne(row) {
       body: row.blob,
     });
     await dvForget(row.id);
+    /* Filing a paper is an operation on the case, so it joins the case's own history. Only the copy
+       held on this device is written: the server keeps the document record, and this is the line the
+       case overview shows beside stage changes. */
+    const local = row.caseId && typeof DB !== 'undefined' ? DB[row.caseId] : null;
+    if (local && typeof logCase === 'function') {
+      logCase(
+        local,
+        'Document filed: ' + (row.category || 'document') + (row.filename ? ' – ' + row.filename : '')
+      );
+      if (typeof sv === 'function') sv();
+    }
     return 'sent';
   } catch (error) {
     /* Bytes already on the server with the same id means the previous attempt landed and this device
@@ -604,6 +615,82 @@ function dvActions(doc) {
   return h('div', { class: 'dv-acts' }, ...buttons);
 }
 
+/* The checklist the administrator keeps under System Settings, answered against the files this case
+   already has. It is read from the case held on this device: the server's document payload names the
+   claim but not its case type, and the screen is reached from inside a case, so the case is here. */
+function dvRequiredDocsPanel() {
+  if (dvState.tab !== 'case' || !dvState.caseId || typeof requiredDocsFor !== 'function') return null;
+  const caseData = typeof DB !== 'undefined' && DB ? DB[dvState.caseId] : null;
+  if (!caseData) return null;
+  const type = String((caseData.f && caseData.f.case_ctype) || '').trim();
+  if (!type) return null;
+  const wanted = requiredDocsFor(caseData.mod || 'motor', type);
+  if (!wanted.length) return null;
+  if (dvState.error) return null;
+
+  const ready = !dvState.loading;
+  /* A rejected file is back with the surveyor, so it does not answer the checklist until it returns. */
+  const present = new Set();
+  (dvState.rows || []).forEach((doc) => {
+    if (doc.status === 'Rejected' || doc.status === 'Replacement Required') return;
+    present.add(doc.category);
+  });
+  /* Only the categories the document routes accept can ever be ticked. An administrator may also
+     write down a paper the eight categories do not name; it stays on the list as something to
+     collect, but it is not counted as a missing file. */
+  const filable =
+    typeof sysDocCategories === 'function' ? sysDocCategories() : [];
+  const tracked = wanted.filter((name) => filable.indexOf(name) !== -1);
+  const extra = wanted.filter((name) => filable.indexOf(name) === -1);
+  const have = tracked.filter((name) => present.has(name)).length;
+  const countText = ready
+    ? `${have} of ${tracked.length} tracked on file` +
+      (extra.length ? ` · ${extra.length} more to collect` : '')
+    : 'Checking the files…';
+  return h(
+    'div',
+    { class: 'dv-req' + (ready && tracked.length && have === tracked.length ? ' done' : '') },
+    h(
+      'div',
+      { class: 'dv-req-head' },
+      h(
+        'div',
+        { class: 'dv-req-title' },
+        h('b', {}, 'Required for this case type'),
+        h('span', { class: 'mu' }, ' · ' + (caseData.mod === 'property' ? 'Property' : 'Motor') + ' · ' + type)
+      ),
+      h('span', { class: 'dv-req-count' }, countText)
+    ),
+    h(
+      'div',
+      { class: 'dv-req-chips' },
+      ...tracked.map((name) => {
+        const ok = present.has(name);
+        return h(
+          'span',
+          {
+            class: 'dv-req-chip' + (ok ? ' ok' : '') + (ready ? '' : ' wait'),
+            title: ok ? 'A file of this category is on record' : 'No file of this category yet',
+          },
+          h('span', { class: 'dv-req-tick', 'aria-hidden': 'true' }, ok ? '✓' : '○'),
+          name
+        );
+      }),
+      ...extra.map((name) =>
+        h(
+          'span',
+          {
+            class: 'dv-req-chip manual',
+            title: 'Collect this paper and file it under the closest document category',
+          },
+          h('span', { class: 'dv-req-tick', 'aria-hidden': 'true' }, '•'),
+          name
+        )
+      )
+    )
+  );
+}
+
 function dvBody() {
   if (dvState.loading && !dvState.rows.length)
     return h('div', { class: 'dv-empty' }, 'Reading the documents…');
@@ -633,6 +720,9 @@ function dvPaint() {
   if (tabs) tabs.replaceChildren(...dvTabs().children);
   const counts = dvState.root.querySelector('.dv-counts-slot');
   if (counts) counts.replaceChildren(dvCounts() || h('span', { hidden: true }));
+  const required = dvState.root.querySelector('.dv-req-slot');
+  if (required)
+    required.replaceChildren(dvRequiredDocsPanel() || h('span', { hidden: true }));
   const upload = dvState.root.querySelector('.dv-upload');
   if (upload) upload.hidden = !dvMay('upload_documents', true);
   const badge = dvState.root.querySelector('.dv-held-badge');
@@ -687,6 +777,7 @@ function renderDocumentsView() {
     h('div', { class: 'dv-held-slot' }, dvPendingPanel() || h('span', { hidden: true })),
     dvTabs(),
     h('div', { class: 'dv-counts-slot' }, dvCounts() || h('span', { hidden: true })),
+    h('div', { class: 'dv-req-slot' }, dvRequiredDocsPanel() || h('span', { hidden: true })),
     h('div', { class: 'dv-body' }, dvBody())
   );
   dvLoad();

@@ -85,6 +85,8 @@ function resumeApp() {
     return;
   }
   if (place.v === 'page') return showInsurerMaster();
+  if (place.v === 'settings' && typeof showSystemSettings === 'function')
+    return showSystemSettings();
   if (place.v === 'account') return showProfilePage(place.section || 'profile');
   if (place.v === 'tasks') return showTasks({ tab: place.tab });
   /* The tab is not checked here: showDocuments drops one this account cannot ask for and showTasks

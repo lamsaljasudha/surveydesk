@@ -3,7 +3,7 @@
    makes installed clients throw away the old cache. Content edits to an existing file
    are picked up by revalidation, so no bump is needed for those. */
 
-const SHELL_VERSION = 'survey-desk-shell-v8';
+const SHELL_VERSION = 'survey-desk-shell-v16';
 
 const SHELL = [
   '/',
@@ -12,7 +12,7 @@ const SHELL = [
   '/css/styles.css',
   '/vendor/html2pdf.bundle.min.js',
   '/vendor/docx.umd.js',
-  '/assets/survey-desk-logo.svg',
+  '/assets/survey-desk-signature-horizontal.svg',
   '/assets/icons/icon-192.png',
   '/assets/icons/icon-512.png',
   '/assets/icons/maskable-512.png',
@@ -49,6 +49,9 @@ const SHELL = [
   '/js/26-documents.js',
   '/js/27-comments.js',
   '/js/28-place.js',
+  '/js/30-system-settings.js',
+  '/js/31-case-overview.js',
+  '/js/32-portal-invites.js',
   '/js/99-main.js',
 ];
 
@@ -89,6 +92,13 @@ self.addEventListener('fetch', (event) => {
 
   // Server data is per-user and must never be served from an offline cache
   if (url.pathname.startsWith('/api/') || url.pathname === '/health') return;
+
+  // A customer's link must always reach the server: the page behind it depends on the token, and a
+  // cached copy would hand one visitor's status to the next one to open the browser.
+  if (url.pathname === '/portal' || url.pathname.startsWith('/portal/')) return;
+
+  // The public form's own stylesheet and script are versioned with the server, never with this app.
+  if (url.pathname.startsWith('/assets/portal.')) return;
 
   if (request.mode === 'navigate' || request.destination === 'document') {
     event.respondWith(offlineFirstNavigation(request, url));

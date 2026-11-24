@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.13.1"
+  },
+  "scripts": {
+    "ai-hq:migrate": "node ai-hq/db/migrate.js up",
+    "ai-hq:bootstrap": "node ai-hq/db/bootstrap.js"
+  }
+}

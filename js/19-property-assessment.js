@@ -341,17 +341,27 @@ function plaUI(m) {
       sv();
     },
     inp = (o, k, ph, ty, cls) => {
-      const e = h('input', { placeholder: ph || '' });
-      if (ty === 'n') {
+      const mny = ty === 'm',
+        e = h('input', { placeholder: ph || '' });
+      if (ty === 'n' || mny) {
         e.inputMode = 'decimal';
       }
-      e.value = o[k] || '';
+      e.value = mny ? inrShow(o[k], true) : o[k] || '';
       if (cls) e.className = cls;
       e.oninput = () => {
-        o[k] = e.value;
+        if (mny) {
+          fmtMoneyInput(e, false);
+          o[k] = inrRaw(e.value);
+        } else o[k] = e.value;
         refresh();
       };
-      e.onblur = () => sv(1);
+      e.onfocus = () => {
+        if (mny) e.value = inrShow(e.value, false);
+      };
+      e.onblur = () => {
+        if (mny) e.value = inrShow(o[k], true);
+        sv(1);
+      };
       return e;
     };
   const mcell = (r, w, k, ph) => {
@@ -424,8 +434,8 @@ function plaUI(m) {
               e.disabled = isT || r.same;
               tr.append(h('td', {}, e));
             });
-            const rc = inp(r, 'cr', 'rate'),
-              ra = inp(r, 'ar', 'rate');
+            const rc = inp(r, 'cr', 'rate', 'm'),
+              ra = inp(r, 'ar', 'rate', 'm');
             if (!isI) {
               rc.disabled = ra.disabled = true;
               rc.value = ra.value = '';
@@ -639,7 +649,7 @@ function plaUI(m) {
               'div',
               { class: 'fld' },
               h('label', {}, 'Salvage rate (Rs per unit)'),
-              inp(S, 'rate', '25', 'n')
+              inp(S, 'rate', '25', 'm')
             )
           ),
           lb,
@@ -689,7 +699,7 @@ function plaUI(m) {
       ['Policy excess (amount)', 'excess'],
       ['Round recommended net loss to nearest', 'round'],
     ].map(([l, k]) =>
-      h('div', { class: 'fld' }, h('label', {}, l), inp(P, k, '', k === 'unote' ? '' : 'n'))
+      h('div', { class: 'fld' }, h('label', {}, l), inp(P, k, '', k === 'unote' ? '' : 'm'))
     )
   );
   m.append(

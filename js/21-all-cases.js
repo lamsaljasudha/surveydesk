@@ -1079,6 +1079,8 @@ document.addEventListener(
     const t = e.target;
     if (!(t instanceof Element)) return;
     if (t.closest('.ac2-menu') || t.closest('.ac2-colbtn') || t.closest('.ac2-dots')) return;
+    const open = acColPop.el || document.querySelector('.ac2-menu');
+    if (!open) return;
     acClosePops();
     e.preventDefault();
     e.stopPropagation();
@@ -1513,19 +1515,16 @@ function acDrawer() {
           )
         )
       );
-    if (kind === 'num')
-      return h(
-        'label',
-        { class: 'ac2-fld' },
-        h('span', {}, label),
-        h('input', {
-          type: 'number',
-          min: '0',
-          step: '1000',
-          value: s[key] || '',
-          oninput: (e) => acRefreshSoonSet(() => set(e.target.value)),
-        })
-      );
+    if (kind === 'num') {
+      const inp = h('input', { type: 'text', inputMode: 'decimal', value: inrShow(s[key], true) });
+      inp.oninput = () => {
+        fmtMoneyInput(inp, false);
+        acRefreshSoonSet(() => set(inrRaw(inp.value)));
+      };
+      inp.onfocus = () => (inp.value = inrShow(inp.value, false));
+      inp.onblur = () => (inp.value = inrShow(inp.value, true));
+      return h('label', { class: 'ac2-fld' }, h('span', {}, label), inp);
+    }
     return h(
       'label',
       { class: 'ac2-fld wide' },

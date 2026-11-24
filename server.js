@@ -12,6 +12,7 @@ const { OAuth2Client } = require('google-auth-library');
 const {
   query,
   POLICY,
+  hashToken,
   initializeDatabase,
   findUserByEmail,
   findUserByGoogleSub,
@@ -26,6 +27,8 @@ const {
   upsertSurveyorProfile,
   updatePasswordHash,
   setAccountNotificationPreferences,
+  listUserAssets,
+  setUserAsset,
   updateLastLogin,
   recordLoginActivity,
   getLoginActivityForUser,
@@ -102,7 +105,25 @@ const {
   getThirdPartyDashboard,
   listThirdPartyClaims,
   upsertThirdPartyClaim,
+  createPortalInvitation,
+  listPortalInvitationsForCase,
+  findPortalInvitationById,
+  findPortalInvitationByToken,
+  revokePortalInvitation,
+  regeneratePortalInvitation,
+  markPortalInvitationOpened,
+  listPortalEvents,
+  findPortalDraft,
+  savePortalDraft,
+  findLatestPortalSubmission,
+  createPortalSubmission,
 } = require('./db');
+const {
+  moduleSectionIds: portalModuleSectionIds,
+  validateValues: validatePortalValues,
+  hashValues: hashPortalValues,
+  publicSections: publicPortalSections,
+} = require('./portal-form');
 
 dotenv.config();
 
@@ -282,6 +303,11 @@ const buildVerifyLink = (token, req = null) =>
   `${buildLandingUrl(req).replace(/\/$/, '')}/index.html?verify=${encodeURIComponent(token)}`;
 const buildEmailChangeLink = (token, req = null) =>
   `${buildLandingUrl(req).replace(/\/$/, '')}/index.html?email-change=${encodeURIComponent(token)}`;
+/* The customer's link carries the opaque token and nothing else — no case id, no account, no query
+   string that a proxy would log. 256 random bits make guessing one hopeless even without the rate
+   limit; the hash of this value is the only form the server keeps. */
+const buildPortalLink = (token, req = null) =>
+  `${buildLandingUrl(req).replace(/\/$/, '')}/portal/${encodeURIComponent(token)}`;
 
 const getClientMetadata = (req) => {
   const userAgent = String(req.get('user-agent') || '');
@@ -470,7 +496,7 @@ const mailShell = ({ greeting, intro, ctaLabel, ctaUrl, expiryNote, extraNote = 
         ${
           ctaLabel && ctaUrl
             ? `<p style="margin:26px 0;">
-            <a href="${escMail(ctaUrl)}" style="display:inline-block;background:#0b5fa5;color:#ffffff;text-decoration:none;padding:13px 26px;border-radius:10px;font-weight:bold;">${escMail(
+            <a href="${escMail(ctaUrl)}" style="display:inline-block;background:#2456a4;color:#ffffff;text-decoration:none;padding:13px 26px;border-radius:10px;font-weight:bold;">${escMail(
               ctaLabel
             )}</a></p>`
             : ''
@@ -479,7 +505,7 @@ const mailShell = ({ greeting, intro, ctaLabel, ctaUrl, expiryNote, extraNote = 
           ctaUrl
             ? `<p style="font-size:13px;color:#5d6b7d;word-break:break-all;">
             If the button does not work, copy this link into your browser:<br />
-            <a href="${escMail(ctaUrl)}" style="color:#0b5fa5;">${escMail(ctaUrl)}</a></p>`
+            <a href="${escMail(ctaUrl)}" style="color:#1b3a62;">${escMail(ctaUrl)}</a></p>`
             : ''
         }
         ${expiryNote ? `<p style="font-size:13px;color:#8a3231;margin:18px 0 0;">${escMail(expiryNote)}</p>` : ''}
@@ -698,6 +724,49 @@ const mailRequestLimiter = (max) =>
 
 const activationMailLimiter = mailRequestLimiter(5);
 const resetMailLimiter = mailRequestLimiter(5);
+
+/* Invitation management is a signed-in action, so the budget is per address rather than per link:
+   it exists to stop a stuck script from filling the table, not to lock an operator out of a case. */
+const portalInviteLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: 'Too many customer-link requests. Please wait a few minutes and try again.',
+    code: 'rate_limited',
+  },
+});
+
+/* The public link is the one route a stranger can reach, so it gets its own budget too — a token
+   is unguessable, but there is no reason to let one address ask the database a thousand times. */
+const portalTokenLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { valid: false, status: 'Unknown', code: 'rate_limited' },
+});
+
+/* A draft is saved while somebody types, so its budget is a ceiling on a runaway script rather than
+   a per-question limit; 40 saves a minute is far more than the form's own debounce can produce. */
+const portalDraftLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { valid: false, status: 'Unknown', code: 'rate_limited' },
+});
+
+/* Submitting is the one public write with weight. A real customer sends once or twice; this budget
+   leaves room for a corrected version and cuts off a script trying to fill the table. */
+const portalSubmitLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { valid: false, status: 'Unknown', code: 'rate_limited' },
+});
 
 const requireAuth = async (req, res, next) => {
   try {
@@ -1195,6 +1264,51 @@ app.patch('/api/account/settings', requireAuth, async (req, res) => {
     });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Unable to update preferences.' });
+  }
+});
+
+/* The signature and stamp used in report footers (§13) belong to the account. The browser keeps a
+   copy in IndexedDB so exports work offline, but the server is what makes an image uploaded on
+   one device show up on every other device signed in to the same account. `saved` distinguishes
+   "never uploaded" from "removed on purpose": a removal stores an empty image instead of deleting
+   the row, so a second device cannot mistake its stale offline copy for an unsynced upload and
+   put a deleted image back. */
+const ASSET_KINDS = new Set(['sig', 'stp']);
+const ASSET_DATA_URL = /^data:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/]+={0,2}$/;
+const ASSET_MAX_CHARS = 3 * 1024 * 1024;
+
+app.get('/api/account/assets', requireAuth, async (req, res) => {
+  try {
+    const rows = await listUserAssets(req.user.id);
+    const saved = { sig: false, stp: false },
+      assets = { sig: '', stp: '' };
+    rows.forEach((row) => {
+      saved[row.kind] = true;
+      assets[row.kind] = row.image || '';
+    });
+    return res.json({ ...assets, saved });
+  } catch (error) {
+    return res.status(500).json({ error: 'Unable to load your signature and stamp.' });
+  }
+});
+
+app.put('/api/account/assets/:kind', requireAuth, async (req, res) => {
+  const kind = String(req.params.kind || '');
+  if (!ASSET_KINDS.has(kind)) {
+    return res.status(400).json({ error: 'Unknown asset type.' });
+  }
+  const image = typeof req.body?.image === 'string' ? req.body.image.trim() : '';
+  if (image && !ASSET_DATA_URL.test(image)) {
+    return res.status(400).json({ error: 'The image must be a PNG, JPEG or WebP data URL.' });
+  }
+  if (image.length > ASSET_MAX_CHARS) {
+    return res.status(413).json({ error: 'The image is too large.' });
+  }
+  try {
+    await setUserAsset(req.user.id, kind, image);
+    return res.json({ ok: true, kind, image });
+  } catch (error) {
+    return res.status(500).json({ error: 'Unable to save your signature and stamp.' });
   }
 });
 
@@ -2273,6 +2387,617 @@ app.delete('/api/cases/:id', requireAuth, requirePermission('delete_case'), asyn
     },
   });
   return res.json({ ok: true });
+});
+
+/* ═══ Customer information portal — invitations ═══════════════════════════════════════════════
+
+   Phase 1 stops at the invitation: the operator can ask a customer for information, hand over a
+   link, see whether it has been opened, re-send it and close it. The form, the uploads and the
+   approval that applies a submission to the case are Phase 2 and 3 — nothing below accepts any
+   customer-supplied information, and nothing below writes to a case. */
+
+const INVITATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const PORTAL_TOKEN_PATTERN = /^[a-f0-9]{64}$/i;
+const PORTAL_EXPIRY_MIN_DAYS = 1;
+const PORTAL_EXPIRY_MAX_DAYS = 90;
+
+const issuePortalToken = () => crypto.randomBytes(32).toString('hex');
+
+/* Omitted means the policy default; anything present and outside the range is refused rather than
+   quietly clamped, because a link that lasts a year when the operator asked for a week would be the
+   same kind of silent change this feature exists to prevent. */
+function readPortalExpiry(value) {
+  if (value === undefined || value === null || value === '') {
+    return { days: POLICY.portalInviteDays };
+  }
+  const days = Number(value);
+  if (
+    !Number.isInteger(days) ||
+    days < PORTAL_EXPIRY_MIN_DAYS ||
+    days > PORTAL_EXPIRY_MAX_DAYS
+  ) {
+    return { error: true };
+  }
+  return { days };
+}
+
+const portalExpiresAt = (days) => new Date(Date.now() + days * 86400000).toISOString();
+
+/* The sections a link asks for are checked against the case's own module, so a property link can
+   never offer a driver page and a motor link can never offer an insured-building page. Omitted or
+   empty means every section the module has, which is also what a Phase 1 invitation stores. */
+function readPortalSections(value, module) {
+  const allowed = portalModuleSectionIds(module);
+  if (value === undefined || value === null) return { ids: null };
+  if (!Array.isArray(value)) return { error: true };
+  const wanted = [...new Set(value.map((v) => String(v).trim()).filter(Boolean))];
+  if (wanted.some((id) => !allowed.includes(id))) return { error: true };
+  return { ids: wanted.length ? wanted : null };
+}
+
+/* The permission question and the case question, in that order, for the two routes that are about a
+   case rather than an existing invitation. */
+async function portalCaseGuard(req, res) {
+  req.permissions = req.permissions || new Set(await loadPermissions(req.user));
+  if (!req.permissions.has('manage_customer_invitations')) {
+    res.status(403).json({
+      error: 'Your account is not permitted to request customer information.',
+      code: 'permission_denied',
+      permission: 'manage_customer_invitations',
+    });
+    return null;
+  }
+  if (!CASE_ID_PATTERN.test(req.params.id)) {
+    res.status(400).json({ error: 'Unknown case.', code: 'case_not_found' });
+    return null;
+  }
+  const row = await findCaseById(req.params.id);
+  if (!row) {
+    res.status(404).json({ error: 'Unknown case.', code: 'case_not_found' });
+    return null;
+  }
+  if (!(await canAccessCase(row, req.user, req.permissions))) {
+    logCaseRefusal(req, req.method + ' /api/cases/:id/invitations', 'case outside this account', row.id);
+    res.status(403).json({ error: 'That case is not yours to open.', code: 'case_forbidden' });
+    return null;
+  }
+  return row;
+}
+
+/* The same two questions for a route that names an invitation. A case deleted after the link was
+   sent leaves the invitation with no case id but does not erase it, so an administrator can still
+   close a link whose case is gone. Nobody below that tier can show the case was theirs. */
+async function portalInvitationGuard(req, res) {
+  req.permissions = req.permissions || new Set(await loadPermissions(req.user));
+  if (!req.permissions.has('manage_customer_invitations')) {
+    res.status(403).json({
+      error: 'Your account is not permitted to manage customer links.',
+      code: 'permission_denied',
+      permission: 'manage_customer_invitations',
+    });
+    return null;
+  }
+  if (!INVITATION_ID_PATTERN.test(req.params.id)) {
+    res.status(404).json({ error: 'Unknown invitation.', code: 'invitation_not_found' });
+    return null;
+  }
+  const invitation = await findPortalInvitationById(req.params.id);
+  if (!invitation) {
+    res.status(404).json({ error: 'Unknown invitation.', code: 'invitation_not_found' });
+    return null;
+  }
+  const caseRow = invitation.caseId ? await findCaseById(invitation.caseId) : null;
+  const allowed = caseRow
+    ? await canAccessCase(caseRow, req.user, req.permissions)
+    : normalizeRole(req.user.role) === ROLES.ADMIN;
+  if (!allowed) {
+    logCaseRefusal(
+      req,
+      req.method + ' /api/invitations/:id',
+      'invitation outside this account',
+      invitation.caseId || invitation.id
+    );
+    res
+      .status(403)
+      .json({ error: 'That invitation is not yours to manage.', code: 'case_forbidden' });
+    return null;
+  }
+  return invitation;
+}
+
+app.get('/api/cases/:id/invitations', requireAuth, async (req, res) => {
+  const caseRow = await portalCaseGuard(req, res);
+  if (!caseRow) return;
+  const invitations = await listPortalInvitationsForCase(caseRow.id);
+  return res.json({
+    invitations,
+    policy: {
+      defaultExpiryDays: POLICY.portalInviteDays,
+      minDays: PORTAL_EXPIRY_MIN_DAYS,
+      maxDays: PORTAL_EXPIRY_MAX_DAYS,
+    },
+  });
+});
+
+app.post('/api/cases/:id/invitations', portalInviteLimiter, requireAuth, async (req, res) => {
+  const caseRow = await portalCaseGuard(req, res);
+  if (!caseRow) return;
+
+  const body = req.body || {};
+  const customerName = taskField(body.customerName, 200);
+  const customerContact = taskField(body.customerContact, 200);
+  const note = taskField(body.note, 2000);
+  if (!customerName) {
+    return res
+      .status(400)
+      .json({ error: 'Say who this link is for.', code: 'customer_name_required' });
+  }
+  const expiry = readPortalExpiry(body.expiresInDays);
+  if (expiry.error) {
+    return res.status(400).json({
+      error: `A link can last between ${PORTAL_EXPIRY_MIN_DAYS} and ${PORTAL_EXPIRY_MAX_DAYS} days.`,
+      code: 'invalid_expiry',
+    });
+  }
+  const requested = readPortalSections(body.requestedSections, caseRow.module);
+  if (requested.error) {
+    return res
+      .status(400)
+      .json({ error: 'Choose the sections from this case’s own form.', code: 'invalid_sections' });
+  }
+
+  const token = issuePortalToken();
+  const expiresAt = portalExpiresAt(expiry.days);
+  const invitation = await createPortalInvitation({
+    caseId: caseRow.id,
+    caseNumber: caseRow.caseNumber,
+    createdBy: req.user.id,
+    tokenHash: hashToken(token),
+    customerName,
+    customerContact,
+    note,
+    requestedSections: requested.ids,
+    expiresAt,
+  });
+
+  await recordAuditLog({
+    actorUserId: req.user.id,
+    action: 'portal_invitation_created',
+    details: {
+      invitationId: invitation.id,
+      caseId: caseRow.id,
+      expiresAt,
+      requestedSections: requested.ids,
+    },
+  });
+
+  /* The token is returned once, here, because the server kept only its hash. It is not a field of
+     the invitation view, so no list, history or refresh can produce it again. */
+  return res.status(201).json({ invitation, link: buildPortalLink(token, req) });
+});
+
+app.post('/api/invitations/:id/revoke', portalInviteLimiter, requireAuth, async (req, res) => {
+  const invitation = await portalInvitationGuard(req, res);
+  if (!invitation) return;
+  if (invitation.status === 'Revoked') {
+    return res
+      .status(409)
+      .json({ error: 'That link is already closed.', code: 'invitation_revoked' });
+  }
+  const reason = taskField((req.body || {}).reason, 500);
+  const updated = await revokePortalInvitation({
+    id: invitation.id,
+    actorUserId: req.user.id,
+    reason,
+  });
+  if (!updated) {
+    return res.status(409).json({
+      error: 'That link changed while you were closing it.',
+      code: 'invitation_changed',
+    });
+  }
+  await recordAuditLog({
+    actorUserId: req.user.id,
+    action: 'portal_invitation_revoked',
+    details: { invitationId: invitation.id, caseId: invitation.caseId, reason },
+  });
+  return res.json({ invitation: updated });
+});
+
+app.post('/api/invitations/:id/regenerate', portalInviteLimiter, requireAuth, async (req, res) => {
+  const invitation = await portalInvitationGuard(req, res);
+  if (!invitation) return;
+  /* Reissuing is how an expired link comes back to life; it is not how a closed one does. A revoked
+     invitation stays closed, and a new one is the explicit act of asking the customer again. */
+  if (invitation.status === 'Revoked') {
+    return res.status(409).json({
+      error: 'A closed link cannot be reissued. Create a new invitation instead.',
+      code: 'invitation_revoked',
+    });
+  }
+  const expiry = readPortalExpiry((req.body || {}).expiresInDays);
+  if (expiry.error) {
+    return res.status(400).json({
+      error: `A link can last between ${PORTAL_EXPIRY_MIN_DAYS} and ${PORTAL_EXPIRY_MAX_DAYS} days.`,
+      code: 'invalid_expiry',
+    });
+  }
+
+  /* Regeneration replaces the token, so the old link stops working the moment the new one exists.
+     The invitation row, its opens and its submissions stay exactly where they were. */
+  const token = issuePortalToken();
+  const expiresAt = portalExpiresAt(expiry.days);
+  const updated = await regeneratePortalInvitation({
+    id: invitation.id,
+    actorUserId: req.user.id,
+    tokenHash: hashToken(token),
+    expiresAt,
+  });
+  if (!updated) {
+    return res.status(409).json({
+      error: 'That link changed while you were reissuing it.',
+      code: 'invitation_changed',
+    });
+  }
+  await recordAuditLog({
+    actorUserId: req.user.id,
+    action: 'portal_invitation_regenerated',
+    details: {
+      invitationId: invitation.id,
+      caseId: invitation.caseId,
+      generation: updated.tokenGeneration,
+      expiresAt,
+    },
+  });
+  return res.json({ invitation: updated, link: buildPortalLink(token, req) });
+});
+
+/* The internal fields the guards read — the case id and the stored hash — never reach a response.
+   Every management answer is built from this shape, which is why no route has to remember to strip
+   them. */
+const portalInvitationView = ({ caseId, tokenHash, ...view }) => view;
+
+app.get('/api/invitations/:id/history', requireAuth, async (req, res) => {
+  const invitation = await portalInvitationGuard(req, res);
+  if (!invitation) return;
+  const events = await listPortalEvents(invitation.id);
+  return res.json({ invitation: portalInvitationView(invitation), events });
+});
+
+/* ── the public side of the link ───────────────────────────────────────────────────────────────
+   A token is the only thing a stranger can present, and everything returned here is about that token
+   and nothing else: no case id, no case number, no names, no figures. Opening a valid link is the
+   one thing recorded, so the operator can tell a link that was never read from one that was. */
+
+/* Counting an open (and recording the first one) belongs to the database function, so the JSON
+   status and the branded page cannot disagree about whether a link was ever read. */
+const notePortalOpen = (invitation) => markPortalInvitationOpened(invitation.id).catch(() => null);
+
+/* A case can be deleted after its links were sent: the invitation row survives for the record, but
+   its case_id becomes NULL and there is no case left to collect information for. The link then reads
+   as closed without rewriting the invitation's own history. */
+const portalPublicStatus = (invitation) => (invitation.caseId ? invitation.status : 'Closed');
+
+app.get('/api/portal/:token', portalTokenLimiter, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  const token = String(req.params.token || '');
+  if (!PORTAL_TOKEN_PATTERN.test(token)) {
+    return res.status(404).json({ valid: false, status: 'Unknown', code: 'invalid_link' });
+  }
+  const invitation = await findPortalInvitationByToken(hashToken(token));
+  if (!invitation) {
+    return res.status(404).json({ valid: false, status: 'Unknown', code: 'invalid_link' });
+  }
+  await notePortalOpen(invitation);
+  const status = portalPublicStatus(invitation);
+  return res.json({
+    valid: status === 'Active',
+    status,
+    expiresAt: invitation.expiresAt,
+  });
+});
+
+/* ── the form a link opens ──────────────────────────────────────────────────────────────────────
+   Every answer here is built from the token's own invitation: its five sections, its draft, its
+   submissions. No route below takes a case id, reads a case field or returns a case number, so a
+   forwarded link can only ever show what the customer typed and what the surveyor chose to ask. */
+
+const PORTAL_SUBMIT_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const setPortalHeaders = (res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+};
+
+const portalModuleOf = (caseRow) => (caseRow.module === 'property' ? 'property' : 'motor');
+
+/* The same three questions the branded page answers — is the token real, is it still open, does its
+   case still exist — returned as JSON for the form's own requests. */
+async function readActivePortalLink(req, res) {
+  setPortalHeaders(res);
+  const token = String(req.params.token || '');
+  if (!PORTAL_TOKEN_PATTERN.test(token)) {
+    res.status(404).json({ valid: false, status: 'Unknown', code: 'invalid_link' });
+    return null;
+  }
+  const invitation = await findPortalInvitationByToken(hashToken(token));
+  if (!invitation) {
+    res.status(404).json({ valid: false, status: 'Unknown', code: 'invalid_link' });
+    return null;
+  }
+  const status = portalPublicStatus(invitation);
+  if (status !== 'Active') {
+    res.status(410).json({
+      valid: false,
+      status,
+      code: status === 'Expired' ? 'link_expired' : 'link_closed',
+    });
+    return null;
+  }
+  return invitation;
+}
+
+app.get('/api/portal/:token/form', portalTokenLimiter, async (req, res) => {
+  const invitation = await readActivePortalLink(req, res);
+  if (!invitation) return;
+  const caseRow = invitation.caseId ? await findCaseById(invitation.caseId) : null;
+  if (!caseRow) {
+    return res.status(410).json({ valid: false, status: 'Closed', code: 'link_closed' });
+  }
+  const module = portalModuleOf(caseRow);
+  const [draft, latest] = await Promise.all([
+    findPortalDraft(invitation.id),
+    findLatestPortalSubmission(invitation.id),
+  ]);
+  return res.json({
+    valid: true,
+    status: 'Active',
+    expiresAt: invitation.expiresAt,
+    customerName: invitation.customerName,
+    sections: publicPortalSections(module, invitation.requestedSections),
+    draft,
+    latestSubmission: latest
+      ? {
+          version: latest.version,
+          submittedAt: latest.submittedAt,
+          values: latest.values,
+          sectionIds: latest.sectionIds,
+        }
+      : null,
+  });
+});
+
+app.put('/api/portal/:token/draft', portalDraftLimiter, async (req, res) => {
+  const invitation = await readActivePortalLink(req, res);
+  if (!invitation) return;
+  const caseRow = invitation.caseId ? await findCaseById(invitation.caseId) : null;
+  if (!caseRow) {
+    return res.status(410).json({ valid: false, status: 'Closed', code: 'link_closed' });
+  }
+  const checked = validatePortalValues(
+    portalModuleOf(caseRow),
+    invitation.requestedSections,
+    (req.body || {}).values,
+    { requireAll: false }
+  );
+  if (checked.error) {
+    return res.status(400).json({
+      error: checked.error,
+      code: checked.code || 'invalid_payload',
+      fields: checked.fields || null,
+    });
+  }
+  if (Object.keys(checked.errors).length) {
+    return res.status(422).json({
+      error: 'Some answers are not in a form this page can save.',
+      code: 'validation_failed',
+      fields: checked.errors,
+    });
+  }
+  const savedAt = await savePortalDraft({ invitationId: invitation.id, values: checked.values });
+  return res.json({ saved: true, savedAt });
+});
+
+app.post('/api/portal/:token/submit', portalSubmitLimiter, async (req, res) => {
+  const invitation = await readActivePortalLink(req, res);
+  if (!invitation) return;
+  const caseRow = invitation.caseId ? await findCaseById(invitation.caseId) : null;
+  if (!caseRow) {
+    return res.status(410).json({ valid: false, status: 'Closed', code: 'link_closed' });
+  }
+
+  const body = req.body || {};
+  if (body.declaration !== true) {
+    return res.status(400).json({
+      error: 'Please confirm the information is complete and correct before sending it.',
+      code: 'declaration_required',
+    });
+  }
+  const checked = validatePortalValues(
+    portalModuleOf(caseRow),
+    invitation.requestedSections,
+    body.values,
+    { requireAll: true }
+  );
+  if (checked.error) {
+    return res.status(400).json({
+      error: checked.error,
+      code: checked.code || 'invalid_payload',
+      fields: checked.fields || null,
+    });
+  }
+  if (Object.keys(checked.errors).length) {
+    return res.status(422).json({
+      error: 'Please complete the highlighted fields.',
+      code: 'validation_failed',
+      fields: checked.errors,
+    });
+  }
+
+  const clientSubmissionId =
+    typeof body.clientSubmissionId === 'string' && PORTAL_SUBMIT_ID_PATTERN.test(body.clientSubmissionId)
+      ? body.clientSubmissionId
+      : null;
+  const sectionIds = publicPortalSections(
+    portalModuleOf(caseRow),
+    invitation.requestedSections
+  ).map((s) => s.id);
+
+  const result = await createPortalSubmission({
+    invitationId: invitation.id,
+    caseId: invitation.caseId,
+    caseNumber: caseRow.caseNumber,
+    values: checked.values,
+    sectionIds,
+    payloadSha256: hashPortalValues(checked.values),
+    clientSubmissionId,
+    customerName: invitation.customerName,
+    customerContact: invitation.customerContact,
+    submittedIp: String(req.ip || req.socket.remoteAddress || '').slice(0, 64),
+    baseCaseModifiedAt: caseRow.modifiedAt,
+  });
+
+  return res.status(result.duplicate ? 200 : 201).json({
+    submission: {
+      version: result.submission.version,
+      status: result.submission.status,
+      submittedAt: result.submission.submittedAt,
+    },
+    duplicate: result.duplicate,
+  });
+});
+
+const portalPageCopy = (status, expiresAt) => {
+  const when = expiresAt
+    ? new Date(expiresAt).toLocaleDateString('en-GB', {
+        day: '2-digit',
+        month: 'long',
+        year: 'numeric',
+        timeZone: 'UTC',
+      })
+    : '';
+  if (status === 'Active') {
+    return {
+      code: 200,
+      heading: 'Your link is active',
+      body: `This secure link is reserved for you${when ? ` until ${when}` : ''}. Keep it private — anyone who has it can use it. The Survey Desk team will ask you to fill in the information form through this page.`,
+    };
+  }
+  if (status === 'Expired') {
+    return {
+      code: 410,
+      heading: 'This link has expired',
+      body: 'For security, links stay open for a limited time. Ask the Survey Desk team to send you a new one — nothing you have already sent has been lost.',
+    };
+  }
+  if (status === 'Revoked' || status === 'Closed') {
+    return {
+      code: 410,
+      heading: 'This link has been closed',
+      body: 'The Survey Desk team closed this link. If you still need to send information, ask them for a new one.',
+    };
+  }
+  return {
+    code: 404,
+    heading: 'This link is not valid',
+    body: 'Check that you copied the whole link from the message. If it still does not open, ask the Survey Desk team to send a new one.',
+  };
+};
+
+const renderPortalPage = (heading, body) => `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="robots" content="noindex, nofollow" />
+<title>${heading} · Survey Desk</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px 16px;
+    font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+    color: #12253f;
+    background: linear-gradient(160deg, #f4f6fa 0%, #e8edf5 100%);
+  }
+  main {
+    width: min(460px, 100%);
+    padding: 28px 26px;
+    background: #fff;
+    border: 1px solid #dbe3ee;
+    border-radius: 18px;
+    box-shadow: 0 18px 46px rgba(18, 37, 63, 0.12);
+  }
+  img { display: block; height: 40px; width: auto; margin: 0 0 18px; }
+  h1 { margin: 0 0 10px; font-size: 19px; letter-spacing: -0.01em; }
+  p { margin: 0; font-size: 14px; line-height: 1.55; color: #4a5b73; }
+  .foot { margin-top: 20px; padding-top: 14px; border-top: 1px solid #e6ebf3; font-size: 12px; color: #7a8798; }
+</style>
+</head>
+<body>
+  <main>
+    <img src="/assets/survey-desk-signature-horizontal.svg" alt="Survey Desk" />
+    <h1>${heading}</h1>
+    <p>${body}</p>
+    <p class="foot">Survey Desk · This page never asks for a password.</p>
+  </main>
+</body>
+</html>`;
+
+/* The active link opens the form itself, not a status card. The token is read from the address bar
+   by the script, so it never appears in the page source, a script tag or an inline value. */
+const renderPortalFormPage = () => `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="robots" content="noindex, nofollow" />
+<meta name="theme-color" content="#12253f" />
+<title>Your information · Survey Desk</title>
+<link rel="icon" href="/assets/icons/icon-192.png" />
+<link rel="stylesheet" href="/assets/portal.css" />
+</head>
+<body>
+  <noscript>
+    <main class="portal-static">
+      <img src="/assets/survey-desk-signature-horizontal.svg" alt="Survey Desk" />
+      <h1>JavaScript is required</h1>
+      <p>This form needs JavaScript to keep your answers safe while you fill it in. Please enable it, or contact the Survey Desk team for another way to send your information.</p>
+    </main>
+  </noscript>
+  <div id="portal-app">
+    <main class="portal-static">
+      <img src="/assets/survey-desk-signature-horizontal.svg" alt="Survey Desk" />
+      <p class="portal-loading">Loading your form…</p>
+    </main>
+  </div>
+  <script src="/assets/portal-form.js" defer></script>
+</body>
+</html>`;
+
+app.get('/portal/:token', portalTokenLimiter, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('X-Robots-Tag', 'noindex, nofollow');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  const token = String(req.params.token || '');
+  const invitation = PORTAL_TOKEN_PATTERN.test(token)
+    ? await findPortalInvitationByToken(hashToken(token))
+    : null;
+  const status = invitation ? portalPublicStatus(invitation) : 'Unknown';
+  if (invitation) await notePortalOpen(invitation);
+  if (status === 'Active') return res.status(200).type('html').send(renderPortalFormPage());
+  const copy = portalPageCopy(status, invitation && invitation.expiresAt);
+  return res
+    .status(copy.code)
+    .type('html')
+    .send(renderPortalPage(copy.heading, copy.body));
 });
 
 /* §9D: candidates for a human to look at, never an automatic merge. Anything with the keys filled

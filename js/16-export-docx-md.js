@@ -586,7 +586,7 @@ function genPaint(kind) {
 }
 
 async function doExport(kind, ed, fm, msg) {
-  const body = clean(ed.innerHTML),
+  const body = mergeBills(kind, clean(ed.innerHTML)),
     base = safeName(g('case_claimNo') || 'case') + '_' + kindCfg(kind).file + '_report',
     out = [];
   const er = (l, e) =>

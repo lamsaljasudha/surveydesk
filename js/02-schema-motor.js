@@ -477,6 +477,10 @@ let ALL = wfOrder(
 
 const NAV = [];
 
+/* The case opens on its overview, and the rail lists it above the workflow groups. It is a screen of
+   its own rather than a form section: no fields, no group heading, and js/31 paints it. */
+const OV_SEC = { k: 'ov', t: 'Overview' };
+
 const hasTP = () => g('case_hasTP') === 'Yes',
   TPK = new Set([
     'case_tpReg',
@@ -498,18 +502,37 @@ const hasTP = () => g('case_hasTP') === 'Yes',
      were written that way and that no record has taken over yet. */
   tpFlat = (f) => f.k.startsWith('tp_') || f.k.startsWith('d2_'),
   tpFlatOn = () => tpLegacyUsed() && !tpFilledRecs().length,
-  /* Three reasons a field stops applying: it is retired outright; there is no third party at all; or
+  /* The insured driver's injury details are only asked once "Injury reported" is Yes; with No (or
+     nothing answered yet) the section carries the question alone, not a form that contradicts it.
+     Unanswered but already holding details keeps them on the page, so a case saved before this
+     rule existed does not lose its record. */
+  d1Injured = () => {
+    const a = g('d1_inj');
+    return a === 'Yes' || (!a && [...D1_INJ].some((k) => String(g(k) || '').trim()));
+  },
+  D1_INJ = new Set([
+    'd1_name',
+    'd1_desc',
+    'd1_hosp',
+    'd1_medRep',
+    'd1_med',
+    'd1_docs',
+    'd1_rem2',
+  ]),
+  /* Reasons a field stops applying: it is retired outright; there is no third party at all; or
      the party this field describes does not consist of what the field asks about (f.ks, set on the
-     schema). The last one reads the answer recorded on party 1, so a claim that hit a pedestrian is
+     schema). That one reads the answer recorded on party 1, so a claim that hit a pedestrian is
      not asked for the other vehicle's chassis number – and a case entered before kinds existed says
-     nothing, keeps every question it was filled in with, and reports exactly as it did. The fourth
+     nothing, keeps every question it was filled in with, and reports exactly as it did. The next
      is the flat third-party set: once the case describes its parties one form per party, the flat
-     questions would ask the same thing a second time, and a section cannot be both. */
+     questions would ask the same thing a second time, and a section cannot be both. The last is the
+     insured driver's injury detail, which only applies once "Injury reported" is Yes. */
   hid = (f) =>
     f.k === 'case_accBS' ||
     (TPK.has(f.k) && !hasTP()) ||
     (f.ks && hasTP() && !tpKindOk(f)) ||
-    (tpFlat(f) && !tpFlatOn());
+    (tpFlat(f) && !tpFlatOn()) ||
+    (D1_INJ.has(f.k) && !d1Injured());
 
 SECS.forEach((s) => {
   /* The 3rd party page is the case's third parties, and the categories with one form per party are
@@ -536,9 +559,9 @@ function syncNav() {
   /* Every section stays in the list, including the third-party ones when they do not apply: the
      navigation then reads "N/A" instead of silently dropping two stages, so an absent third party
      is a stated fact rather than an unfinished section. vis() still governs the fields and issues. */
-  NAV.push(...ALL);
+  NAV.push(OV_SEC, ...ALL);
   syncPC();
-  if (!NAV.some((s) => s.k === sec)) sec = 'case';
+  if (!NAV.some((s) => s.k === sec)) sec = 'ov';
 }
 
 const MODS = {

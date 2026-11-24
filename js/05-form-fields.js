@@ -19,8 +19,11 @@ function fld(f) {
     );
   } else if (f.t === A) i = h('textarea', { rows: f.rows || 3 });
   else {
-    i = h('input', { type: IT[f.t] });
-    if (f.t === N || f.t === M) {
+    /* A money box is a text box on purpose: grouping commas and the closing /- are what the
+       surveyor expects to see, and type=number would refuse to hold them. */
+    i = h('input', { type: f.t === M ? 'text' : IT[f.t] });
+    if (f.t === M) i.inputMode = 'decimal';
+    if (f.t === N) {
       i.step = 'any';
       i.inputMode = 'decimal';
       if (f.min != null) i.min = f.min;
@@ -43,10 +46,13 @@ function fld(f) {
   }
   i.id = 'f_' + k;
   if (f.t === 'k') i.checked = Dd.f[k] === 'Yes';
+  else if (f.t === M || f.t === C) i.value = inrShow(Dd.f[k], true);
   else i.value = Dd.f[k] || '';
   if (f.t !== C) {
-    const val = () => (i.type === 'checkbox' ? (i.checked ? 'Yes' : '') : i.value);
+    const val = () =>
+      i.type === 'checkbox' ? (i.checked ? 'Yes' : '') : f.t === M ? inrRaw(i.value) : i.value;
     i.oninput = i.onchange = () => {
+      if (f.t === M) fmtMoneyInput(i, document.activeElement !== i);
       Dd.f[k] = val();
       (Dd.man = Dd.man || {})[k] = Dd.auto && Dd.auto[k] === Dd.f[k] ? 0 : 1;
       const nAf = autofill();
@@ -63,17 +69,23 @@ function fld(f) {
          built again rather than only re-checked. Keep the current scroll position so ticking the
          involvement type does not force the user back to the top of the case form. */
       if (k === 'tp_kind') render({ preserveScroll: true });
+      /* Injury details appear and disappear with the answer, so this page is rebuilt too. */
+      if (k === 'd1_inj') render({ preserveScroll: true });
     };
     /* Leaving a box is where an answer stops being typing and becomes the case's: the write that has
        been keeping up with the keystrokes goes in at once, and the surveyor is told which box that was.
        What the box held when it was entered decides whether anything changed, so tabbing through a form
        nobody edited stays quiet. */
-    i.onfocus = () => (i._v = val());
+    i.onfocus = () => {
+      if (f.t === M) i.value = inrShow(i.value, false);
+      i._v = val();
+    };
     i.onblur = () => {
       const moved = typeof i._v === 'string' && val() !== i._v;
       TCH.add(k);
       paint();
       sv(1);
+      if (f.t === M) i.value = inrShow(i.value, true);
       if (moved) toast(f.l + ' saved', '✓ ');
     };
   }

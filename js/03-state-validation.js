@@ -160,7 +160,7 @@ function recalc() {
         );
         Dd.f[f.k] = String(v);
         const e = document.getElementById('f_' + f.k);
-        if (e) e.value = v;
+        if (e) e.value = inrShow(v, true);
       }
     })
   );

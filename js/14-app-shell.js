@@ -105,8 +105,24 @@ function pager() {
 
 function render(options = {}) {
   const preserveScroll = !!options.preserveScroll;
-  const m = $('#main'),
-    s = NAV.find((x) => x.k === sec),
+  const m = $('#main');
+  /* The overview is a dashboard and takes the width of the window, the way the All cases screen does;
+     the case forms keep their narrower reading column. The class follows the section, so stepping from
+     the overview into a form narrows the panel again without a second rule to remember. */
+  const shell = document.querySelector('.app');
+  if (shell) shell.classList.toggle('ov-wide', sec === 'ov');
+  /* The overview is a screen, not a form: it paints its own hero, cards and navigation, so it returns
+     before any field section is built. nav() still runs through paint(), which is what lights its
+     row in the rail and the phone strip. */
+  if (sec === 'ov') {
+    camStop();
+    m.replaceChildren(ovUI());
+    paint();
+    rememberPlace();
+    if (!preserveScroll) window.scrollTo(0, 0);
+    return;
+  }
+  const s = NAV.find((x) => x.k === sec),
     na = !!(s.show && !s.show());
   /* The viewfinder keeps running only on the page that shows it. */
   if (sec !== 'photos') camStop();
@@ -225,6 +241,10 @@ function render(options = {}) {
      phone strip, the pager, a jump from the review list or from Quick Capture — ends in this repaint,
      so this is the one place that can say it. */
   rememberPlace();
+  /* Kept next to rememberPlace but separate from it: that one records the whole screen for a reload,
+     while this one answers the overview's Resume work button, which asks only which working section
+     this person last opened on this case. */
+  if (typeof ovRememberWork === 'function') ovRememberWork(sec);
   if (!preserveScroll) window.scrollTo(0, 0);
 }
 
@@ -346,16 +366,10 @@ $('#audit-btn').onclick = () => {
 };
 
 $('#ms').onclick = () => {
-  showDash();
+  if (typeof showSystemSettings === 'function') showSystemSettings();
+  else showDash();
   setMenu('ms');
   closeSideMenu();
-  setTimeout(() => {
-    const d = document.querySelector('#dash details');
-    if (d) {
-      d.open = true;
-      d.scrollIntoView({ behavior: 'smooth' });
-    }
-  }, 150);
 };
 
 $('#ins-master-btn').onclick = () => {

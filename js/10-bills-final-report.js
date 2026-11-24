@@ -9,7 +9,13 @@ const BT = {
   },
   bq = (q) => q === 'ra' || q === 'a' || hasTP(),
   sbl = (q, k) =>
-    bn(q).reduce((a, iv) => a + iv.rows.reduce((b, r) => b + (+r[k] > 0 ? +r[k] : 0), 0), 0);
+    bn(q).reduce((a, iv) => a + iv.rows.reduce((b, r) => b + (+r[k] > 0 ? +r[k] : 0), 0), 0),
+  /* A row or invoice counts as entered when any of its fields carries something: a line that only
+     has a description yet, or only an assessed figure, is still part of the table the surveyor
+     expects to see in the report. */
+  rowFilled = (r) => !!(r.d || r.qty || r.rate || r.amt || r.as || r.rm),
+  ivFilled = (iv) => !!(iv.no || iv.vendor || iv.date || iv.rows.some(rowFilled)),
+  billsHave = () => MOD === MODS.motor && Object.keys(BT).filter(bq).some((q) => bn(q).some(ivFilled));
 
 function finCalc() {
   const n = (k) => Number(g(k)) || 0,
@@ -60,6 +66,15 @@ function finTable() {
       .join('') +
     '</table>'
   );
+}
+
+/* The complete bills block, built from the case rather than written by a model: every invoice and
+   every entered row, then the computed calculation. This is the one definition of what a final
+   report carries, whichever way the draft was produced. */
+function billsSectionHTML() {
+  return billsHave()
+    ? '<h2>Bills and final assessment</h2>' + billsHTML() + finTable()
+    : '';
 }
 
 function clean(s) {
@@ -137,7 +152,7 @@ function aiPrompt(kind) {
               (hasTP() ? ' and third party' : '') +
               ' with billed vs assessed details and remarks; 6 Medical expenses with billed vs assessed details; 7 Surveyor’s final calculation and assessment (reproduce the computed table exactly); 8 Observations, deductions and policy conditions applied; 9 Final conclusion, recommendation and follow-up actions'
             : '1 Reference and case summary; 2 Policy details; 3 Circumstances of loss and narrative; 4 Damage findings and inspection observations; 5 Assessment of loss; 6 Surveyor’s final calculation and assessment; 7 Observations, deductions and policy conditions applied; 8 Final conclusion and recommendation';
-  return `You are an experienced licensed insurance surveyor in Nepal drafting a ${K.title} ${MOD.name.replace(' survey', '')} survey report for the insurer.\nRules: use ONLY the facts in the data below. Never invent facts, names, numbers or dates; write "Not provided" where data is missing. Do not do your own arithmetic: use the computed figures given. Formal, neutral, detailed and insurer-ready tone. Amounts in NPR.\nGoal: ${
+  return `You are an experienced licensed insurance surveyor in Nepal drafting a ${K.title} ${MOD.name.replace(' survey', '')} survey report for the insurer.\nRules: use ONLY the facts in the data below. Never invent facts, names, numbers or dates; write "Not provided" where data is missing. Do not do your own arithmetic: use the computed figures given. Formal, neutral, detailed and insurer-ready tone. Amounts in NPR.${kind === 'final' && mo ? ' The complete bills and medical-expense tables are appended to the report from the case data after generation: write about them, but never replace them with a summary or drop an invoice row.' : ''}\nGoal: ${
     kind === 'spot'
       ? 'a short on-scene record that reads well inside two A4 pages. Be factual and concise: what was seen, what was said, what was photographed. Do NOT write a bills section, a medical expenses section or a final calculation - those belong to the final report and are not allowed here.'
       : 'produce a complete, well-structured survey report, not a short overview. Include every important fact, summary, narration, and calculation. Do not omit relevant details.'
@@ -175,6 +190,7 @@ function dropExcluded(kind, html) {
       /^[.\s]*\d+[.)]?\s/.test(c.nodeType === 3 ? c.textContent : '')
     );
     if (t) t.textContent = t.textContent.replace(/^\s*\d+[.)]?\s/, ++n + '. ');
+    else h2.textContent = ++n + '. ' + h2.textContent;
   };
   [...d.body.childNodes].forEach((el) => {
     if (el.nodeName === 'H2') {
@@ -198,14 +214,65 @@ function draftHTML(kind) {
   /* reportHTML() writes the preliminary template, so PRELIMINARY in its title is the word every
      other kind renames. */
   o = o.split('PRELIMINARY').join(K.title);
-  if (K.bills && MOD === MODS.motor)
-    o += '<h2>Bills and final assessment</h2>' + billsHTML() + finTable();
+  if (K.bills) o += billsSectionHTML();
   /* A report with no cover sheet - a spot report - opens with the identification block the engine
      writes at the head of page 1, which is the same title and reference table the template puts at
      the top of the draft. Only the draft is trimmed here: what the surveyor has typed themselves is
      left for docBuild to report rather than remove. */
   if (!K.cover) o = o.replace(/<h1>[\s\S]*?<\/table>/, '');
   return dropExcluded(kind, o);
+}
+
+/* "final assessment" is deliberately not in this list: it is the name of the case's own assessment
+   fields in the data template, and those must survive the merge. The generated report's calculation
+   section is recognised by "final calculation". */
+const BILLS_HEAD = /\bbills?\b|medical expenses?|final calculation/i;
+
+/* A generated draft is convincing but it is not the record: models fold the invoices into a summary
+   table and drop rows. The bills are derived data, so any section the model wrote about bills,
+   medical expenses or the final calculation is replaced here by the complete section from the
+   case. Section numbers live in the heading text, so they are rewritten after the merge. */
+function mergeBills(kind, html) {
+  const sec = kindCfg(kind).bills ? billsSectionHTML() : '';
+  if (!sec) return html;
+  const d = new DOMParser().parseFromString(html, 'text/html'),
+    groups = [];
+  let cur = { h: null, n: [] };
+  groups.push(cur);
+  [...d.body.childNodes].forEach((n) => {
+    if (n.nodeType === 1 && n.tagName === 'H2') {
+      cur = { h: n, n: [n] };
+      groups.push(cur);
+    } else cur.n.push(n);
+  });
+  const sd = new DOMParser().parseFromString(sec, 'text/html'),
+    sn = [...sd.body.childNodes].filter((n) => n.nodeType === 1 || (n.textContent || '').trim()),
+    sg = { h: sn.find((n) => n.tagName === 'H2'), n: sn },
+    keep = [];
+  let placed = false;
+  groups.forEach((g) => {
+    if (g.h && BILLS_HEAD.test(g.h.textContent)) {
+      if (!placed) {
+        keep.push(sg);
+        placed = true;
+      }
+      return;
+    }
+    keep.push(g);
+  });
+  if (!placed) keep.push(sg);
+  let no = 0;
+  keep.forEach((g) => {
+    if (!g.h) return;
+    const t = [...g.h.childNodes].find((c) =>
+      /^[.\s]*\d+[.)]?\s/.test(c.nodeType === 3 ? c.textContent : '')
+    );
+    if (t) t.textContent = t.textContent.replace(/^\s*\d+[.)]?\s/, ++no + '. ');
+    else g.h.textContent = ++no + '. ' + g.h.textContent;
+  });
+  return keep
+    .map((g) => g.n.map((n) => n.outerHTML || esc(n.textContent || '')).join(''))
+    .join('');
 }
 
 function genUI(m, kind) {
@@ -225,7 +292,7 @@ function genUI(m, kind) {
   let dirty = false,
     tm,
     armed = false;
-  ed.innerHTML = R.html || '';
+  ed.innerHTML = R.html ? clean(mergeBills(kind, R.html)) : '';
   const sd = () => {
     dirty = false;
     R.html = clean(ed.innerHTML);
@@ -281,7 +348,7 @@ function genUI(m, kind) {
         },
       });
       const words = (String(r.text || '').match(/\S+/g) || []).length;
-      ed.innerHTML = clean(r.text);
+      ed.innerHTML = clean(mergeBills(kind, r.text));
       sd();
       msg.textContent =
         'Generated and saved — ' +

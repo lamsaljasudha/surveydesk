@@ -164,8 +164,8 @@ function pri(c) {
 /* The eight headline counts. Keys double as All Cases filter ids (FT), so a card and the table
    under it always agree. Icons stay text glyphs to match the rest of the shell — no icon set. */
 const KP = [
-    ['tot', 'Total cases', '#2563eb', '▤', (c) => true],
-    ['act', 'Active cases', '#2563eb', '⚡', act],
+    ['tot', 'Total cases', '#2456a4', '▤', (c) => true],
+    ['act', 'Active cases', '#2456a4', '⚡', act],
     ['new', 'New intimations', '#0ea5e9', '✉', (c) => c.st === 'Intimation'],
     ['unas', 'Unassigned cases', '#64748b', '○', (c) => !c.owner],
     [
@@ -176,7 +176,7 @@ const KP = [
       (c) => ['Initial Review', 'Physical Inspection'].includes(c.st),
     ],
     ['pp', 'Preliminary reports pending', '#d97706', '📝', (c) => pend(c, 'p')],
-    ['fp', 'Final reports pending', '#1d4ed8', '📄', (c) => pend(c, 'f')],
+    ['fp', 'Final reports pending', '#1b3a62', '📄', (c) => pend(c, 'f')],
     [
       'od',
       'Overdue cases',
@@ -279,7 +279,9 @@ function activityEntries(V, limit) {
           id: r.id,
           cid: r.c.id,
           who: r.c.owner || 'Unassigned',
-          txt: i ? 'Moved to ' + e.s : 'Intimation logged',
+          /* An entry may carry its own words (e.a) when the operation was not a stage change, such
+             as a document being filed against the case. */
+          txt: e.a || (i ? 'Moved to ' + e.s : 'Intimation logged'),
           cl: !i ? 'new' : e.s === 'Survey Complete' ? 'ok' : '',
         });
     });
@@ -305,6 +307,17 @@ function setStage(c, s) {
   if (i >= 7 && !c.fSub) c.fSub = today();
   c.u = Date.now();
   sv(1);
+}
+
+/* Not every event is a stage change: filing a paper against the case is real work that the history
+   should show. c.hist is already the one timestamped log the app keeps, so the entry goes there with
+   its own sentence rather than inventing a second store. The actor is still not recorded, so readers
+   show the assigned surveyor, exactly as activityEntries() already does. */
+function logCase(c, text) {
+  const line = String(text || '').trim();
+  if (!c || !line) return;
+  (c.hist = c.hist || []).push({ s: c.st || 'Intimation', t: Date.now(), a: line });
+  c.u = Date.now();
 }
 
 function trackUI(c) {
@@ -419,6 +432,10 @@ function openCase(id, targetSec) {
   /* Documents belong to whoever may send one, which is the key the upload route asks for — not to
      whoever may check one, so a member files their scan and never sees a decision button. */
   $('#td').hidden = !mayUse('upload_documents', true);
+  /* A customer link is issued and closed by whoever may send one, which is the key the invitation
+     routes ask for. The customer never holds an account, so this is the officer's key, not the
+     customer's. */
+  $('#tci').hidden = !mayUse('manage_customer_invitations', cfg.role !== 'Staff');
   /* The thread is the case, so it opens for anyone who may write in it — and add_case_comments is the
      key the posting route asks for. A member who cannot post still gets the button when the role
      default allows reading, which is why the fallback is true and not the key's own grant. */
@@ -427,8 +444,10 @@ function openCase(id, targetSec) {
   $('#ct').hidden = false;
   setMenu('');
   load(id);
+  /* Every way into a case — the directory, a notification, a deep link — lands on its overview, and
+     a caller that names a section (targetSec) still opens exactly that section. */
   if (targetSec && NAV.some((s) => s.k === targetSec)) sec = targetSec;
-  else sec = 'case';
+  else sec = 'ov';
   hdr();
   sv(1);
   render();
@@ -446,14 +465,41 @@ function caseArrivalDate(c) {
   return new Date(c.asg || c.cr || c.u || Date.now());
 }
 
+/* Cases store the insurer as free text and older entries abbreviate the legal name, so the same
+   company arrived as both "Sagarmatha Lumbini Insurance Co. Ltd." and "Sagarmatha Lumbini Insurance
+   Company Limited" and the donut drew it twice. A recorded value is folded into the licensee whose
+   known name (marketing, legal, symbol or alias) is the longest substring of it; the longest match
+   wins so a short code inside a longer name cannot claim the case. Anything that matches no
+   licensee keeps its own label, so a one-off or foreign insurer is still counted, just as typed. */
+function insurerIdentity(name) {
+  const raw = String(name || '').trim();
+  if (!raw || raw === '—') return { key: '', label: 'Insurer not recorded' };
+  const v = ns(raw);
+  let best = null,
+    bestLen = 0;
+  NIA_NONLIFE.forEach((x) => {
+    [x.m, x.n, x.s, ...(x.a || [])].forEach((k) => {
+      const key = ns(k);
+      if (key && key.length > bestLen && v.includes(key)) {
+        best = x;
+        bestLen = key.length;
+      }
+    });
+  });
+  return best ? { key: best.n, label: best.n } : { key: 'raw:' + raw.toLowerCase(), label: raw };
+}
+
 /* One pass over the role-visible rows to count cases per insurer, highest first.
    Feeds both the chart's filter list and the "by insurer" breakdown, so the two never disagree. */
 function insurerBreakdown(rows) {
   const m = new Map();
-  rows.forEach((r) => m.set(r.ins, (m.get(r.ins) || 0) + 1));
-  return [...m.entries()]
-    .map(([name, count]) => ({ name, count, label: name === '—' ? 'Insurer not recorded' : name }))
-    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
+  rows.forEach((r) => {
+    const id = insurerIdentity(r.ins),
+      cur = m.get(id.key);
+    if (cur) cur.count += 1;
+    else m.set(id.key, { name: id.label, label: id.label, count: 1 });
+  });
+  return [...m.values()].sort((a, b) => b.count - a.count || a.name.localeCompare(b.name));
 }
 
 function insurerLabel(name) {
@@ -473,7 +519,7 @@ function pctStr(n, t) {
   return (v >= 10 ? Math.round(v) : Math.round(v * 10) / 10) + '%';
 }
 
-const INS_COLORS = ['#2563eb', '#0ea5e9', '#16a34a', '#d97706', '#7c3aed', '#0f766e'];
+const INS_COLORS = ['#2456a4', '#0ea5e9', '#16a34a', '#d97706', '#7c3aed', '#0f766e'];
 const INS_OTHER = '#94a3b8';
 const CHART_SPANS = [3, 6, 12];
 
@@ -491,7 +537,9 @@ function buildIntimationsChart(rows) {
     });
   }
   const at = new Map(buckets.map((b) => [b.key, b]));
-  const scoped = chartIns ? rows.filter((r) => r.ins === chartIns) : rows;
+  const scoped = chartIns
+    ? rows.filter((r) => insurerIdentity(r.ins).label === chartIns)
+    : rows;
   scoped.forEach((r) => {
     const b = at.get(monthKey(caseArrivalDate(r.c)));
     if (b) b.value += 1;
@@ -570,7 +618,7 @@ function buildIntimationsChart(rows) {
         width: bw,
         height: bh,
         rx: 3,
-        fill: '#2563eb',
+        fill: '#2456a4',
       });
       bar.append(
         svgEl('title', {}, b.label + ': ' + b.value + ' intimation' + (b.value === 1 ? '' : 's'))
@@ -583,7 +631,7 @@ function buildIntimationsChart(rows) {
             x: x + bw / 2,
             y: height - bottom - bh - 6,
             'text-anchor': 'middle',
-            fill: '#2563eb',
+            fill: '#2456a4',
             'font-size': '11',
             'font-weight': '700',
           },
@@ -1055,14 +1103,14 @@ function buildSecurityActivityCard(entries, caption) {
       { class: flagged ? `sec-flag ${failed ? 'is-bad' : 'is-warn'}` : '' },
       h(
         'td',
-        {},
+        { 'data-label': 'Event' },
         h('div', { class: 'sec-device' }, describeSecurityEvent(entry)),
         h('div', { class: 'sec-sub' }, [securityDeviceLabel(entry), entry.ipAddress].join(' · '))
       ),
-      h('td', {}, securityTime(entry.createdAt)),
+      h('td', { 'data-label': 'When' }, securityTime(entry.createdAt)),
       h(
         'td',
-        {},
+        { 'data-label': 'Result' },
         h(
           'span',
           { class: 'sec-tag ' + (failed ? 'is-bad' : 'is-ok') },
@@ -2255,16 +2303,16 @@ async function showProfilePage(section = 'profile') {
           { class: session.isCurrent ? 'sec-current' : '' },
           h(
             'td',
-            {},
+            { 'data-label': 'Device' },
             h('div', { class: 'sec-device' }, securityDeviceLabel(session)),
             h('div', { class: 'sec-sub' }, session.ipAddress || 'Unknown'),
             session.isCurrent ? h('span', { class: 'sec-tag is-current' }, 'This device') : null
           ),
-          h('td', {}, securityTime(session.createdAt)),
-          h('td', {}, securityTime(session.lastActiveAt)),
+          h('td', { 'data-label': 'Signed in' }, securityTime(session.createdAt)),
+          h('td', { 'data-label': 'Last active' }, securityTime(session.lastActiveAt)),
           h(
             'td',
-            { class: 'sec-action' },
+            { class: 'sec-action', 'data-label': 'Action' },
             session.isCurrent
               ? h('span', { class: 'mu' }, 'In use')
               : h(
@@ -2482,8 +2530,11 @@ async function showProfilePage(section = 'profile') {
         h('h3', {}, 'Administrative audit log'),
         audit && audit.logs && audit.logs.length
           ? h(
-              'table',
-              { class: 'account-table' },
+              'div',
+              { class: 'account-table-scroll' },
+              h(
+                'table',
+                { class: 'account-table' },
               h(
                 'thead',
                 {},
@@ -2513,6 +2564,7 @@ async function showProfilePage(section = 'profile') {
                     h('td', {}, entry.target_name || '—')
                   )
                 )
+              )
               )
             )
           : h('p', { class: 'mu' }, 'No audit entries yet.')
@@ -2572,12 +2624,12 @@ function showInsurerMaster() {
         h(
           'tr',
           {},
-          h('td', {}, x.m),
-          h('td', {}, x.n),
-          h('td', {}, x.s || '—'),
-          h('td', {}, licence(x.c)),
-          h('td', {}, (x.a || []).join(', ') || '—'),
-          h('td', {}, String(used(x)))
+          h('td', { 'data-label': 'Master name' }, x.m),
+          h('td', { 'data-label': 'Legal name' }, x.n),
+          h('td', { 'data-label': 'Code' }, x.s || '—'),
+          h('td', { 'data-label': 'Licence' }, licence(x.c)),
+          h('td', { 'data-label': 'Former / merged names' }, (x.a || []).join(', ') || '—'),
+          h('td', { 'data-label': 'Cases' }, String(used(x)))
         )
       )
     );
@@ -2861,9 +2913,7 @@ function buildDash() {
                     onclick: () => openCase(r.c.id),
                     title: 'Open ' + r.id,
                   },
-                  h('b', {}, r.id),
                   h('span', { class: 'who' }, r.who),
-                  h('span', { class: 'stg' }, r.c.st),
                   h('span', { class: 'left' }, d.txt)
                 );
               })
@@ -2871,57 +2921,6 @@ function buildDash() {
           : h('p', { class: 'mu' }, 'No open deadlines.')
       )
     );
-  };
-  const accountRole = normalizeServerRole((getCurrentAuthUser() || {}).role);
-  const fs = (l, i) => h('div', { class: 'setting-field' }, h('label', {}, l), i),
-    /* The settings and the preview switch follow the account, not the view being looked at: an
-       administrator previewing the staff layout must still be able to edit the deadlines, and a
-       staff member must not be able to move either by touching anything here. */
-    ro = accountRole !== 'ADMIN',
-    rs = h('select', {}, ...ROLE_VIEWS.map((x) => h('option', { value: x }, x))),
-    nmI = h('input', { maxlength: '60' }),
-    pdI = h('input', { type: 'number', min: '1', max: '365' }),
-    fdI = h('input', { type: 'number', min: '1', max: '365' }),
-    cn = h(
-      'select',
-      {},
-      h('option', { value: 'cal' }, 'Calendar days'),
-      h('option', { value: 'wk' }, 'Working days (excl. Saturday)')
-    );
-  rs.value = cfg.role;
-  rs.disabled = ro;
-  nmI.value = cfg.me;
-  nmI.disabled = ro;
-  pdI.value = cfg.pd;
-  fdI.value = cfg.fd;
-  cn.value = cfg.cnt;
-  pdI.disabled = fdI.disabled = cn.disabled = ro;
-  rs.onchange = () => {
-    cfg.role = rs.value;
-    saveCfg();
-    FL.k = FL.s = '';
-    hdr();
-    drawDash();
-  };
-  nmI.onchange = () => {
-    cfg.me = nmI.value.trim() || 'Surveyor';
-    saveCfg();
-    drawDash();
-  };
-  pdI.onchange = () => {
-    cfg.pd = Math.min(365, Math.max(1, +pdI.value || 15));
-    saveCfg();
-    drawDash();
-  };
-  fdI.onchange = () => {
-    cfg.fd = Math.min(365, Math.max(1, +fdI.value || 60));
-    saveCfg();
-    drawDash();
-  };
-  cn.onchange = () => {
-    cfg.cnt = cn.value;
-    saveCfg();
-    drawDash();
   };
   el.replaceChildren(
     h(
@@ -3093,38 +3092,7 @@ function buildDash() {
         })()
       )
     ),
-    h('div', { class: 'chart-grid' }, buildIntimationsChart(rowsF()), buildInsurerDonut(V)),
-    h(
-      'details',
-      { class: 'card settings-panel' },
-      h(
-        'summary',
-        { class: 'settings-summary' },
-        h('span', { class: 'settings-summary-title' }, 'Role & settings'),
-        h('span', { class: 'settings-summary-pill' }, 'Preferences')
-      ),
-      h(
-        'div',
-        { class: 'settings-body' },
-        h(
-          'div',
-          { class: 'settings-grid' },
-          fs(ro ? 'Your role' : 'Preview the layout for', rs),
-          fs('My name (cases assigned to me)', nmI),
-          fs('Preliminary report deadline (days)', pdI),
-          fs('Final report deadline (days)', fdI),
-          fs('Counting rule', cn),
-          signUI()
-        ),
-        h(
-          'p',
-          { class: 'settings-note' },
-          ro
-            ? 'Your dashboard follows the role on your SurveyPro account, and the server checks it on every request. Ask an administrator to change it.'
-            : 'Admin: all cases, deadline settings, delete. Principal Surveyor: all cases and reassignment. Staff: only cases assigned to them. This switch only changes what you see; it does not change anyone else’s access.'
-        )
-      )
-    )
+    h('div', { class: 'chart-grid' }, buildIntimationsChart(rowsF()), buildInsurerDonut(V))
   );
 }
 
@@ -3175,7 +3143,7 @@ function autofill() {
     const e = document.getElementById('f_' + t);
     if (e) {
       if (e.type === 'checkbox') e.checked = Dd.f[t] === 'Yes';
-      else e.value = Dd.f[t];
+      else e.value = FM[t] && FM[t].t === M ? inrShow(Dd.f[t], true) : Dd.f[t];
       e.classList.add('fup');
       setTimeout(() => e.classList.remove('fup'), 1800);
     }

@@ -1219,7 +1219,7 @@ function tpFieldUI(o, f) {
   let i;
   if (f.t === 'a') i = h('textarea', { id, rows: '2', maxlength: '3000' });
   else if (f.t === 'm') {
-    i = h('input', { id, type: 'number', step: 'any', min: '0' });
+    i = h('input', { id, type: 'text' });
     i.inputMode = 'decimal';
   } else if (f.t === 'n') i = h('input', { id, type: 'number', step: '1', min: '0', max: '120' });
   else if (f.t === 'y')
@@ -1261,9 +1261,12 @@ function tpFieldUI(o, f) {
     };
   else if (f.t === 'sel') i.onchange = () => put(i.value, true);
   else {
-    i.value = o[f.k] || '';
+    i.value = f.t === 'm' ? inrShow(o[f.k], true) : o[f.k] || '';
     i.oninput = () => {
-      o[f.k] = i.value;
+      if (f.t === 'm') {
+        fmtMoneyInput(i, false);
+        o[f.k] = inrRaw(i.value);
+      } else o[f.k] = i.value;
       sv();
     };
     /* A date is answered in one go, the same as a dropdown; anything typed is settled on leaving. */
@@ -1271,9 +1274,10 @@ function tpFieldUI(o, f) {
     else
       i.onblur = () => {
         const was = i._v,
-          moved = typeof was === 'string' && String(i.value).trim() !== was;
-        o[f.k] = String(i.value).trim();
-        i.value = o[f.k];
+          cur = f.t === 'm' ? inrRaw(i.value) : String(i.value).trim(),
+          moved = typeof was === 'string' && cur !== was;
+        o[f.k] = cur;
+        i.value = f.t === 'm' ? inrShow(cur, true) : cur;
         sv(1);
         /* The notice belongs to a box that actually changed, so tabbing through a form nobody edited
            stays quiet; the save itself has been keeping up with the typing already. */
@@ -1283,7 +1287,10 @@ function tpFieldUI(o, f) {
         if (f.st) render({ preserveScroll: true });
         else if (o.kind) tpPaintHead(o);
       };
-    i.onfocus = () => (i._v = i.value);
+    i.onfocus = () => {
+      if (f.t === 'm') i.value = inrShow(i.value, false);
+      i._v = f.t === 'm' ? inrRaw(i.value) : i.value;
+    };
   }
   return h(
     'div',

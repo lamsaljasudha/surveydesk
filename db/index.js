@@ -44,6 +44,9 @@ const POLICY = {
   resetTokenMinutes: num(process.env.RESET_TOKEN_MINUTES, 30),
   maxFailedLogins: num(process.env.MAX_FAILED_LOGINS, 5),
   lockoutMinutes: num(process.env.LOCKOUT_MINUTES, 15),
+  /* How long a customer's information link works before it has to be re-sent. Closing a link never
+     touches what the customer already sent — retention is deliberately a separate question. */
+  portalInviteDays: num(process.env.PORTAL_INVITE_DAYS, 7),
 };
 
 /* Tokens used to be argon2-hashed, which meant every request replayed the whole sessions table
@@ -340,6 +343,27 @@ async function setAccountNotificationPreferences(userId, preferences = {}) {
     [JSON.stringify(preferences || {}), userId]
   );
   return result.rowCount ? result.rows[0] : null;
+}
+
+/* Report footer images travel with the account, not the browser: rows are returned as they are so
+   the route can tell "never uploaded" (no row) from "removed" (row with an empty image). */
+async function listUserAssets(userId) {
+  const result = await getPool().query('SELECT kind, image FROM user_assets WHERE user_id = $1', [
+    userId,
+  ]);
+  return result.rows;
+}
+
+async function setUserAsset(userId, kind, image) {
+  const result = await getPool().query(
+    `INSERT INTO user_assets (user_id, kind, image, updated_at)
+     VALUES ($1, $2, $3, NOW())
+     ON CONFLICT (user_id, kind) DO UPDATE
+     SET image = EXCLUDED.image, updated_at = NOW()
+     RETURNING kind, image`,
+    [userId, kind, image || '']
+  );
+  return result.rows[0] || null;
 }
 
 async function updateLastLogin(userId, metadata = {}) {
@@ -2601,6 +2625,436 @@ async function upsertThirdPartyClaim(payload = {}) {
   );
 }
 
+/* ── customer information portal ─────────────────────────────────────────────────────────────
+   The management API only ever answers with these views, which is why the case id and the token
+   hash never appear in them: the screen already knows the case it opened, and the hash is not a
+   thing anybody needs to see. The one exception is findPortalInvitationById/ByToken, which the
+   routes use internally to check case access. */
+
+function portalInvitationStatus(row, now = Date.now()) {
+  if (row.revoked_at) return 'Revoked';
+  if (row.expires_at && new Date(row.expires_at).getTime() <= now) return 'Expired';
+  return 'Active';
+}
+
+function mapPortalInvitation(row) {
+  return {
+    id: row.id,
+    customerName: row.customer_name,
+    customerContact: row.customer_contact,
+    note: row.note,
+    requestedSections: Array.isArray(row.requested_sections) ? row.requested_sections : null,
+    status: portalInvitationStatus(row),
+    expiresAt: row.expires_at,
+    revokedAt: row.revoked_at,
+    revokeReason: row.revoke_reason,
+    regeneratedAt: row.regenerated_at,
+    firstOpenedAt: row.first_opened_at,
+    lastOpenedAt: row.last_opened_at,
+    openCount: Number(row.open_count || 0),
+    tokenGeneration: Number(row.token_generation || 1),
+    createdAt: row.created_at,
+    submissionCount: Number(row.submission_count || 0),
+    latestSubmission: row.latest_submission_id
+      ? {
+          id: row.latest_submission_id,
+          version: Number(row.latest_version || 1),
+          status: row.latest_status,
+          submittedAt: row.latest_submitted_at,
+        }
+      : null,
+  };
+}
+
+async function createPortalInvitation({
+  caseId,
+  caseNumber,
+  createdBy,
+  tokenHash,
+  customerName,
+  customerContact,
+  note,
+  requestedSections,
+  expiresAt,
+}) {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    const inserted = await client.query(
+      `INSERT INTO case_portal_invitations
+         (case_id, case_number, created_by, token_hash, customer_name, customer_contact, note,
+          requested_sections, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+       RETURNING *`,
+      [
+        caseId,
+        caseNumber || null,
+        createdBy || null,
+        tokenHash,
+        customerName,
+        customerContact || null,
+        note || null,
+        requestedSections ? JSON.stringify(requestedSections) : null,
+        expiresAt,
+      ]
+    );
+    const row = inserted.rows[0];
+    await client.query(
+      `INSERT INTO case_portal_submission_events (invitation_id, actor_type, actor_user_id, action, details)
+       VALUES ($1, 'operator', $2, 'invitation_created', $3::jsonb)`,
+      [
+        row.id,
+        createdBy || null,
+        JSON.stringify({
+          expiresAt,
+          requestedSections: Array.isArray(row.requested_sections) ? row.requested_sections : null,
+        }),
+      ]
+    );
+    await client.query('COMMIT');
+    return mapPortalInvitation(row);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function listPortalInvitationsForCase(caseId) {
+  const result = await query(
+    `SELECT i.*,
+            ls.id AS latest_submission_id,
+            ls.version AS latest_version,
+            ls.status AS latest_status,
+            ls.original_submitted_at AS latest_submitted_at,
+            (SELECT COUNT(*) FROM case_portal_submissions c WHERE c.invitation_id = i.id) AS submission_count
+       FROM case_portal_invitations i
+       LEFT JOIN LATERAL (
+         SELECT id, version, status, original_submitted_at
+           FROM case_portal_submissions s
+          WHERE s.invitation_id = i.id
+          ORDER BY s.version DESC
+          LIMIT 1
+       ) ls ON TRUE
+      WHERE i.case_id = $1
+      ORDER BY i.created_at DESC`,
+    [caseId]
+  );
+  return result.rows.map(mapPortalInvitation);
+}
+
+async function findPortalInvitationById(id) {
+  const result = await query('SELECT * FROM case_portal_invitations WHERE id = $1', [id]);
+  const row = result.rows[0];
+  if (!row) return null;
+  return { ...mapPortalInvitation(row), caseId: row.case_id, tokenHash: row.token_hash };
+}
+
+async function findPortalInvitationByToken(tokenHash) {
+  const result = await query('SELECT * FROM case_portal_invitations WHERE token_hash = $1', [
+    tokenHash,
+  ]);
+  const row = result.rows[0];
+  if (!row) return null;
+  return { ...mapPortalInvitation(row), caseId: row.case_id, tokenHash: row.token_hash };
+}
+
+async function revokePortalInvitation({ id, actorUserId, reason }) {
+  const result = await query(
+    `UPDATE case_portal_invitations
+        SET revoked_at = NOW(), revoked_by = $2, revoke_reason = $3, updated_at = NOW()
+      WHERE id = $1 AND revoked_at IS NULL
+      RETURNING *`,
+    [id, actorUserId || null, reason || null]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  await query(
+    `INSERT INTO case_portal_submission_events (invitation_id, actor_type, actor_user_id, action, reason)
+     VALUES ($1, 'operator', $2, 'invitation_revoked', $3)`,
+    [id, actorUserId || null, reason || null]
+  );
+  return mapPortalInvitation(row);
+}
+
+async function regeneratePortalInvitation({ id, actorUserId, tokenHash, expiresAt }) {
+  const result = await query(
+    `UPDATE case_portal_invitations
+        SET token_hash = $2, token_generation = token_generation + 1,
+            regenerated_at = NOW(), expires_at = $3, updated_at = NOW()
+      WHERE id = $1 AND revoked_at IS NULL
+      RETURNING *`,
+    [id, tokenHash, expiresAt]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  await query(
+    `INSERT INTO case_portal_submission_events (invitation_id, actor_type, actor_user_id, action, details)
+     VALUES ($1, 'operator', $2, 'invitation_regenerated', $3::jsonb)`,
+    [id, actorUserId || null, JSON.stringify({ expiresAt, generation: row.token_generation })]
+  );
+  return mapPortalInvitation(row);
+}
+
+/* One place counts an open, so the JSON status and the branded page cannot disagree about whether
+   a link was ever read. The first open is also the one event this writes — a customer refreshing a
+   page is not history worth a row per refresh. */
+async function markPortalInvitationOpened(id) {
+  const result = await query(
+    `WITH before AS (
+       SELECT first_opened_at FROM case_portal_invitations WHERE id = $1
+     )
+     UPDATE case_portal_invitations i
+        SET open_count = i.open_count + 1,
+            first_opened_at = COALESCE(i.first_opened_at, NOW()),
+            last_opened_at = NOW(),
+            updated_at = NOW()
+      WHERE i.id = $1
+      RETURNING (SELECT first_opened_at FROM before) AS previous_first_opened_at`,
+    [id]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  if (!row.previous_first_opened_at) {
+    await addPortalEvent({ invitationId: id, actorType: 'customer', action: 'invitation_opened' });
+  }
+  return row;
+}
+
+async function addPortalEvent({
+  invitationId,
+  submissionId = null,
+  actorType = 'system',
+  actorUserId = null,
+  action,
+  fromStatus = null,
+  toStatus = null,
+  reason = null,
+  details = {},
+}) {
+  const result = await query(
+    `INSERT INTO case_portal_submission_events
+       (invitation_id, submission_id, actor_type, actor_user_id, action, from_status, to_status, reason, details)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+     RETURNING id`,
+    [
+      invitationId || null,
+      submissionId || null,
+      actorType,
+      actorUserId || null,
+      action,
+      fromStatus,
+      toStatus,
+      reason,
+      JSON.stringify(details || {}),
+    ]
+  );
+  return result.rows[0];
+}
+
+async function listPortalEvents(invitationId) {
+  const result = await query(
+    `SELECT e.id, e.action, e.actor_type, e.actor_user_id, u.full_name AS actor_name,
+            e.from_status, e.to_status, e.reason, e.details, e.created_at
+       FROM case_portal_submission_events e
+       LEFT JOIN users u ON u.id = e.actor_user_id
+      WHERE e.invitation_id = $1
+      ORDER BY e.created_at DESC, e.id DESC
+      LIMIT 100`,
+    [invitationId]
+  );
+  return result.rows.map((row) => ({
+    id: row.id,
+    action: row.action,
+    actorType: row.actor_type,
+    actorName: row.actor_name || null,
+    fromStatus: row.from_status,
+    toStatus: row.to_status,
+    reason: row.reason,
+    details: row.details,
+    createdAt: row.created_at,
+  }));
+}
+
+/* A submission as the customer's browser may see it: their own answers, the version they created and
+   when they sent it. The review columns, the case id and the operator's corrections stay internal. */
+function mapPortalSubmission(row) {
+  const payload =
+    row.original_payload && typeof row.original_payload === 'object' ? row.original_payload : {};
+  return {
+    id: row.id,
+    version: Number(row.version || 1),
+    status: row.status,
+    submittedAt: row.original_submitted_at,
+    values: payload.values && typeof payload.values === 'object' ? payload.values : {},
+    sectionIds: Array.isArray(payload.sections) ? payload.sections : [],
+  };
+}
+
+async function findPortalDraft(invitationId) {
+  const result = await query(
+    'SELECT payload, updated_at FROM case_portal_drafts WHERE invitation_id = $1',
+    [invitationId]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  const payload = row.payload && typeof row.payload === 'object' ? row.payload : {};
+  return {
+    values: payload.values && typeof payload.values === 'object' ? payload.values : {},
+    updatedAt: row.updated_at,
+  };
+}
+
+async function savePortalDraft({ invitationId, values }) {
+  const result = await query(
+    `INSERT INTO case_portal_drafts (invitation_id, payload, updated_at)
+     VALUES ($1, $2::jsonb, NOW())
+     ON CONFLICT (invitation_id)
+     DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
+     RETURNING updated_at`,
+    [invitationId, JSON.stringify({ values: values || {} })]
+  );
+  return result.rows[0].updated_at;
+}
+
+async function deletePortalDraft(invitationId) {
+  await query('DELETE FROM case_portal_drafts WHERE invitation_id = $1', [invitationId]);
+}
+
+async function findLatestPortalSubmission(invitationId) {
+  const result = await query(
+    `SELECT * FROM case_portal_submissions
+      WHERE invitation_id = $1
+      ORDER BY version DESC
+      LIMIT 1`,
+    [invitationId]
+  );
+  return result.rowCount ? mapPortalSubmission(result.rows[0]) : null;
+}
+
+/* A version is written only after the invitation row is locked, so two submits arriving together
+   cannot both read version 1 and race for the same number. The client id and the content hash each
+   answer "is this the same attempt?"; either one being already present returns the existing version
+   instead of writing another. The database's partial unique index is the last word on the client id. */
+async function createPortalSubmission({
+  invitationId,
+  caseId,
+  caseNumber,
+  values,
+  sectionIds,
+  payloadSha256,
+  clientSubmissionId,
+  customerName,
+  customerContact,
+  submittedIp,
+  baseCaseModifiedAt,
+}) {
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT id FROM case_portal_invitations WHERE id = $1 FOR UPDATE', [
+      invitationId,
+    ]);
+
+    if (clientSubmissionId) {
+      const existing = await client.query(
+        `SELECT * FROM case_portal_submissions
+          WHERE invitation_id = $1 AND client_submission_id = $2
+          LIMIT 1`,
+        [invitationId, clientSubmissionId]
+      );
+      if (existing.rowCount) {
+        await client.query('DELETE FROM case_portal_drafts WHERE invitation_id = $1', [
+          invitationId,
+        ]);
+        await client.query('COMMIT');
+        return { submission: mapPortalSubmission(existing.rows[0]), duplicate: true };
+      }
+    }
+
+    const latest = await client.query(
+      `SELECT version, payload_sha256 FROM case_portal_submissions
+        WHERE invitation_id = $1
+        ORDER BY version DESC
+        LIMIT 1`,
+      [invitationId]
+    );
+    if (latest.rowCount && latest.rows[0].payload_sha256 === payloadSha256) {
+      const same = await client.query(
+        `SELECT * FROM case_portal_submissions
+          WHERE invitation_id = $1
+          ORDER BY version DESC
+          LIMIT 1`,
+        [invitationId]
+      );
+      await client.query('DELETE FROM case_portal_drafts WHERE invitation_id = $1', [invitationId]);
+      await client.query('COMMIT');
+      return { submission: mapPortalSubmission(same.rows[0]), duplicate: true };
+    }
+
+    const version = latest.rowCount ? Number(latest.rows[0].version) + 1 : 1;
+    const payload = { schemaVersion: 1, values, sections: sectionIds };
+    const inserted = await client.query(
+      `INSERT INTO case_portal_submissions
+         (invitation_id, case_id, case_number, version, status, original_payload,
+          original_submitted_at, base_case_modified_at, customer_name, customer_contact,
+          submitted_ip, client_submission_id, payload_sha256)
+       VALUES ($1, $2, $3, $4, 'Submitted', $5::jsonb, NOW(), $6, $7, $8, $9, $10, $11)
+       RETURNING *`,
+      [
+        invitationId,
+        caseId || null,
+        caseNumber || null,
+        version,
+        JSON.stringify(payload),
+        baseCaseModifiedAt || null,
+        customerName || null,
+        customerContact || null,
+        submittedIp || null,
+        clientSubmissionId || null,
+        payloadSha256,
+      ]
+    );
+    const row = inserted.rows[0];
+    await client.query('DELETE FROM case_portal_drafts WHERE invitation_id = $1', [invitationId]);
+    await client.query(
+      `INSERT INTO case_portal_submission_events
+         (invitation_id, submission_id, actor_type, action, to_status, details)
+       VALUES ($1, $2, 'customer', 'submission_received', 'Submitted', $3::jsonb)`,
+      [
+        invitationId,
+        row.id,
+        JSON.stringify({
+          version,
+          sectionCount: Array.isArray(sectionIds) ? sectionIds.length : 0,
+          payloadSha256,
+        }),
+      ]
+    );
+    await client.query('COMMIT');
+    return { submission: mapPortalSubmission(row), duplicate: false };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    /* The unique index on (invitation_id, client_submission_id) is the race after the lock; if it
+       fired, the other request wrote the same attempt and its row is the answer. */
+    if (error.code === '23505' && clientSubmissionId) {
+      const existing = await query(
+        `SELECT * FROM case_portal_submissions
+          WHERE invitation_id = $1 AND client_submission_id = $2
+          LIMIT 1`,
+        [invitationId, clientSubmissionId]
+      );
+      if (existing.rowCount) {
+        return { submission: mapPortalSubmission(existing.rows[0]), duplicate: true };
+      }
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 module.exports = {
   pool,
   query,
@@ -2620,6 +3074,8 @@ module.exports = {
   upsertSurveyorProfile,
   updatePasswordHash,
   setAccountNotificationPreferences,
+  listUserAssets,
+  setUserAsset,
   updateLastLogin,
   recordLoginActivity,
   getLoginActivityForUser,
@@ -2698,4 +3154,18 @@ module.exports = {
   getThirdPartyDashboard,
   listThirdPartyClaims,
   upsertThirdPartyClaim,
+  createPortalInvitation,
+  listPortalInvitationsForCase,
+  findPortalInvitationById,
+  findPortalInvitationByToken,
+  revokePortalInvitation,
+  regeneratePortalInvitation,
+  markPortalInvitationOpened,
+  addPortalEvent,
+  listPortalEvents,
+  findPortalDraft,
+  savePortalDraft,
+  deletePortalDraft,
+  findLatestPortalSubmission,
+  createPortalSubmission,
 };

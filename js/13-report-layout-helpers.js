@@ -399,26 +399,120 @@ const shrinkPng = (f, mx) =>
     fr.readAsDataURL(f);
   });
 
-const getA = (k) =>
-    pdb('readonly', (s) => s.get('asset_' + k))
-      .then((r) => (r && r.img) || '')
-      .catch(() => ''),
-  setA = (k, img) => put({ id: 'asset_' + k, cid: '_g', img, t: 0 });
+/* The signature and stamp are account assets, so the server is the source of truth: an image
+   uploaded on the laptop has to appear on a phone that signs in to the same account. IndexedDB
+   stays as the offline copy — an export never waits for the network, and the app still works when
+   it is opened without a session. `saved` comes from the server and says whether a row exists at
+   all, which is what separates "never uploaded" from "removed on purpose": only the first lets a
+   device adopt its older local copy, so a removal is not undone by another browser. */
+const ASSETS = { sig: '', stp: '', saved: { sig: false, stp: false }, loaded: false };
+let ASSETS_LOADING = null;
+
+const currentUserId = () => {
+  try {
+    const u = typeof getCurrentAuthUser === 'function' ? getCurrentAuthUser() : null;
+    return (u && u.id) || '';
+  } catch {
+    return '';
+  }
+};
+
+const assetsRequest = async (path, options) => {
+  /* A stalled server must not hold up a report export: the local copy is the fallback, so the
+     request gives up instead of waiting for the browser's own timeout. */
+  const signal =
+    typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+      ? AbortSignal.timeout(8000)
+      : undefined;
+  const response = await fetch(path, { credentials: 'include', signal, ...options });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || 'Asset request failed');
+  return payload;
+};
+
+const loadServerAssets = () => {
+  if (!ASSETS_LOADING) {
+    ASSETS_LOADING = assetsRequest('/api/account/assets')
+      .then((payload) => {
+        ASSETS.sig = typeof payload.sig === 'string' ? payload.sig : '';
+        ASSETS.stp = typeof payload.stp === 'string' ? payload.stp : '';
+        ASSETS.saved = payload.saved || { sig: false, stp: false };
+        ASSETS.loaded = true;
+        return ASSETS;
+      })
+      .catch(() => null);
+  }
+  return ASSETS_LOADING;
+};
+
+const localA = (k) =>
+  pdb('readonly', (s) => s.get('asset_' + k)).catch(() => null);
+
+const getA = async (k) => {
+  const server = await loadServerAssets();
+  const localRec = await localA(k);
+  const local = (localRec && localRec.img) || '';
+  if (server && ASSETS.loaded) {
+    if (ASSETS.saved[k]) return ASSETS[k];
+    /* First sign-in after this account gained server storage: adopt the image already on this
+       browser instead of asking for it again. Legacy records carry no uid, so they are adopted
+       by whichever account signs in here first; a copy stamped with another account's id is
+       ignored, and so is everything once a removal row exists. */
+    if (local && (!localRec.uid || localRec.uid === currentUserId())) {
+      try {
+        await assetsRequest('/api/account/assets/' + k, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: local }),
+        });
+        ASSETS[k] = local;
+        ASSETS.saved[k] = true;
+        return local;
+      } catch {
+        return local;
+      }
+    }
+    return '';
+  }
+  return local;
+};
+
+const setA = async (k, img) => {
+  await put({ id: 'asset_' + k, cid: '_g', img, t: Date.now(), uid: currentUserId() }).catch(
+    () => {}
+  );
+  if (ASSETS_LOADING) await ASSETS_LOADING;
+  else await loadServerAssets();
+  try {
+    await assetsRequest('/api/account/assets/' + k, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: img }),
+    });
+    ASSETS.loaded = true;
+    ASSETS[k] = img;
+    ASSETS.saved[k] = true;
+    return { synced: true };
+  } catch {
+    return { synced: false };
+  }
+};
 
 function signUI() {
   const mk = (k, l) => {
       const i = h('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp' }),
         m = h('div', { class: 'upst' }),
         pv = h('img', { class: 'upv', alt: '' }),
-        bx = h('div', { class: 'upb' }, pv),
-        rm = h('button', { class: 'b', type: 'button' }, 'Remove');
+        ph = h('span', { class: 'uph' }, 'No image yet'),
+        bx = h('div', { class: 'upb empty' }, pv, ph),
+        rm = h('button', { class: 'b danger', type: 'button' }, 'Remove');
       const say = (t, c) => {
           m.textContent = t;
           m.className = 'upst ' + (c || '');
         },
         show = (v) => {
           pv.src = v || '';
-          bx.style.display = v ? 'flex' : 'none';
+          bx.classList.toggle('empty', !v);
           rm.style.display = v ? '' : 'none';
         };
       show('');
@@ -426,7 +520,9 @@ function signUI() {
       getA(k).then((v) => {
         show(v);
         say(
-          v ? '✓ Saved – used in the footer of every report page' : 'Not uploaded yet',
+          v
+            ? '✓ On file – printed in the footer of every report page'
+            : 'Not uploaded yet – reports will print without it',
           v ? 'ok' : ''
         );
       });
@@ -446,11 +542,18 @@ function signUI() {
         say('Uploading…');
         try {
           const d = await shrinkPng(f, 600);
-          await setA(k, d);
+          const saved = await setA(k, d);
           const back = await getA(k);
           if (back !== d) throw 0;
           show(back);
-          say('✓ Uploaded and saved (' + f.name + ')', 'ok');
+          say(
+            saved.synced
+              ? '✓ Saved – used on every device signed in to this account'
+              : ASSETS.loaded
+                ? '✓ Saved on this device – account sync failed, try again when online'
+                : '✓ Saved on this device only – sign in to use it on other devices',
+            saved.synced ? 'ok' : ''
+          );
         } catch {
           say('✖ Upload failed – the image could not be read or saved. Try another PNG.', 'er');
         }
@@ -458,14 +561,14 @@ function signUI() {
       };
       rm.onclick = async () => {
         try {
-          await setA(k, '');
+          const saved = await setA(k, '');
           show('');
-          say('Removed', '');
+          say(saved.synced ? 'Removed from your account' : 'Removed from this device', '');
         } catch {
           say('✖ Could not remove the image', 'er');
         }
       };
-      return h('div', { class: 'fld' }, h('label', {}, l), i, bx, m, rm);
+      return h('div', { class: 'fld asset-field' }, h('label', {}, l), i, bx, m, rm);
     },
     dsT = h('textarea', { rows: 7 });
   dsT.value = cfg.disc || DISC;
@@ -646,7 +749,7 @@ function fitPreview(pane, sheet) {
 async function previewDoc(kind, ed, anx, msg) {
   msg.textContent = 'Building preview…';
   try {
-    const built = await docBuild(kind, clean(ed.innerHTML), anx, true),
+    const built = await docBuild(kind, mergeBills(kind, clean(ed.innerHTML)), anx, true),
       w = h('div', { class: 'dc' });
     w.innerHTML = built.el.innerHTML;
     built.el.remove();

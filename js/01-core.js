@@ -80,6 +80,57 @@ const T = 't',
 
 const F = (n, l, t = T, o = {}) => ({ n, l, t, ...o });
 
+/* Money boxes read the Nepali way, 12,34,567, and settle with /-, but the case keeps the plain
+   number underneath: sums, validation, reports and exports never see a comma. */
+const inrRaw = (v) => {
+  const m = /-?\d[\d,]*(?:\.\d*)?/.exec(String(v == null ? '' : v));
+  return m ? m[0].replace(/,/g, '') : '';
+};
+
+/* 1234567 -> 12,34,567; decimals are kept exactly as typed. */
+const inrGroup = (raw) => {
+  const s = String(raw == null ? '' : raw),
+    m = /^(-?)(\d+)(\.\d*)?$/.exec(s);
+  if (!m) return s;
+  const [, sign, int, dec = ''] = m;
+  if (int.length <= 3) return sign + int + dec;
+  return (
+    sign +
+    int.slice(0, -3).replace(/\B(?=(\d{2})+(?!\d))/g, ',') +
+    ',' +
+    int.slice(-3) +
+    dec
+  );
+};
+
+const inrShow = (v, settled) => {
+  const raw = settled ? inrRaw(v).replace(/\.$/, '') : inrRaw(v);
+  if (!raw) return '';
+  const g = inrGroup(raw);
+  return settled && /\d$/.test(g) ? g + '/-' : g;
+};
+
+/* Format in place while the caret is inside; what was typed before the caret stays before it. */
+const fmtMoneyInput = (el, settled) => {
+  const shown = inrShow(el.value, settled);
+  if (el.value === shown) return;
+  const focused = document.activeElement === el,
+    pos = el.selectionStart,
+    before = pos == null ? 0 : (el.value.slice(0, pos).match(/[\d.]/g) || []).length;
+  el.value = shown;
+  if (focused && pos != null) {
+    let seen = 0,
+      at = 0;
+    while (at < shown.length && seen < before) {
+      if (/[\d.]/.test(shown[at])) seen++;
+      at++;
+    }
+    try {
+      el.setSelectionRange(at, at);
+    } catch {}
+  }
+};
+
 const YN = ['Yes', 'No'],
   YNP = ['Yes', 'No', 'Pending'],
   VER = ['Verified', 'Pending', 'Not verified', 'Not applicable'];

@@ -84,6 +84,7 @@ function issues() {
    set. A section key that is not listed gets the plain document glyph. */
 const IC_DOC = 'M6.5 2.8h5.2l2.6 2.6v11.2H6.5zM9 9.5h4.5M9 12.5h4.5',
   SEC_IC = {
+    ov: 'M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z',
     case: IC_DOC,
     pol: 'M10 2.6l6 2.3v4.5c0 3.9-2.5 6.4-6 8-3.5-1.6-6-4.1-6-8V4.9z',
     fp: 'M10 9.6a3.1 3.1 0 100-6.2 3.1 3.1 0 000 6.2zM4.6 16.9c.6-2.9 2.7-4.4 5.4-4.4s4.8 1.5 5.4 4.4',
@@ -134,20 +135,24 @@ function navRow(s, is) {
     done = !!rs.length && filled === rs.length && !e,
     bd = h('span', { class: 'bd' });
 
-  if (na) bd.append(h('b', { class: 'na' }, 'N/A'));
-  else if (!rs.length) {
-    // Reports, photos and bills have no fields to tally, so only the issues they raise count.
-    if (e) bd.append(h('b', { class: 'er' }, '\u2716' + e));
-    else if (w) bd.append(h('b', { class: 'wn' }, '\u26a0' + w));
-    else bd.append(h('i', { class: 'nt' }));
-  } else {
-    if (done) bd.append(h('b', { class: 'ok' }, '\u2713'));
-    else {
-      if (!started) bd.append(h('i', { class: 'nt' }));
-      bd.append(h('b', { class: started ? 'nv-ct er' : 'nv-ct' }, filled + '/' + rs.length));
-      if (started && (e || bad)) bd.append(h('b', { class: 'er' }, '\u2716' + Math.max(e, bad)));
+  /* The overview is not a form to finish, so it carries no tally; a dot there would read as an
+     unfinished section. */
+  if (s.k !== 'ov') {
+    if (na) bd.append(h('b', { class: 'na' }, 'N/A'));
+    else if (!rs.length) {
+      // Reports, photos and bills have no fields to tally, so only the issues they raise count.
+      if (e) bd.append(h('b', { class: 'er' }, '\u2716' + e));
+      else if (w) bd.append(h('b', { class: 'wn' }, '\u26a0' + w));
+      else bd.append(h('i', { class: 'nt' }));
+    } else {
+      if (done) bd.append(h('b', { class: 'ok' }, '\u2713'));
+      else {
+        if (!started) bd.append(h('i', { class: 'nt' }));
+        bd.append(h('b', { class: started ? 'nv-ct er' : 'nv-ct' }, filled + '/' + rs.length));
+        if (started && (e || bad)) bd.append(h('b', { class: 'er' }, '\u2716' + Math.max(e, bad)));
+      }
+      if (w) bd.append(h('b', { class: 'wn' }, '\u26a0' + w));
     }
-    if (w) bd.append(h('b', { class: 'wn' }, '\u26a0' + w));
   }
 
   const hint = na
